@@ -53,57 +53,70 @@ def run_joint_surgical_search(args):
         num_filters = target_layer.out_channels if hasattr(target_layer, 'out_channels') else target_layer.out_features
         del temp_model
         
-        # Dynamic Grouping: Conv (16) vs FC (1024) for speed
-        if "conv" in layer_name:
-            group_size = 16
-        else:
-            group_size = 1024 # Target 15M register result faster
-            
-        num_groups = math.ceil(num_filters / group_size)
-    
-        layer_bits = [8] * num_filters
+    for layer_name in layers_to_optimize:
+        print(f"\n>>> Optimizing Layer: {layer_name}")
         
-        for g in tqdm(range(num_groups), desc=f"Searching {layer_name}"):
-            start_f = g * group_size
-            end_f = min((g + 1) * group_size, num_filters)
-            
-            # Greedy: Try 2-bit, then 4-bit
+        # Get number of filters/neurons in this layer
+        temp_model = load_model(args.model, checkpoint_path=args.checkpoint)
+        target_layer = dict(temp_model.named_modules())[layer_name]
+        num_filters = target_layer.out_channels if hasattr(target_layer, 'out_channels') else target_layer.out_features
+        del temp_model
+        
+        # Initialize bits for this layer to 8
+        if layer_name not in best_config or not isinstance(best_config[layer_name], list):
+            layer_bits = [8] * num_filters
+        else:
+            layer_bits = best_config[layer_name]
+    
+        # Strict Filter-by-Filter / Neuron-by-Neuron search
+        for i in tqdm(range(num_filters), desc=f"Surgical Pulse: {layer_name}"):
+            # Greedy Optimization: Try 2-bit first, then 4-bit
             for trial_bits in [2, 4]:
                 temp_layer_bits = list(layer_bits)
-                for i in range(start_f, end_f):
-                    temp_layer_bits[i] = trial_bits
+                temp_layer_bits[i] = trial_bits
                 
-                # Update current best config with these trial bits for this layer
+                # Test Model with updated bit for this specific filter/neuron
                 test_config = dict(best_config)
                 test_config[layer_name] = temp_layer_bits
                 
-                # Test Model
                 torch.cuda.empty_cache()
                 model = load_model(args.model, checkpoint_path=args.checkpoint)
-                # Wrap with current test config
+                # Wrap ensuring Joint Weight+Activation and Handoff Locks (verified in MQF engine)
                 model = wrap_model_for_mqf(model, test_config, register_width=args.register_width, joint=True)
                 model.to(device)
+                model.eval()
                 
+                # Real-time Hardware-Fidelity Accuracy check
                 acc = evaluate_accuracy(model, loader, device=device, max_samples=args.samples)
                 total_drop = baseline_acc - acc
                 
                 if total_drop <= args.max_drop:
-                    # Accepted!
-                    layer_bits = temp_layer_bits
+                    # ACCEPTED: Signal integrity maintained in this node
+                    layer_bits[i] = trial_bits
                     best_config[layer_name] = layer_bits
                     
-                    # Register Savings math: 2 filters per reg at 8-bit, 4 at 4-bit, 8 at 2-bit (for reg_w=16)
-                    regs_at_8 = (end_f - start_f) / (args.register_width / 8)
-                    regs_at_trial = (end_f - start_f) / (args.register_width / trial_bits)
-                    regs_saved = int(regs_at_8 - regs_at_trial)
+                    status = f"ACCEPTED ({trial_bits}b)"
+                    regs_at_8 = 1 / (args.register_width / 8)
+                    regs_at_trial = 1 / (args.register_width / trial_bits)
+                    regs_saved = regs_at_8 - regs_at_trial
                     
                     with open(log_path, 'a', newline='') as f:
-                        csv.writer(f).writerow([layer_name, g, f"{start_f}-{end_f-1}", trial_bits, acc, total_drop, "ACCEPTED", regs_saved])
-                    break # Success for this group
+                        csv.writer(f).writerow([layer_name, "N/A", i, trial_bits, acc, total_drop, "ACCEPTED", regs_saved])
+                    
+                    # Periodic checkpoint
+                    if i % 10 == 0:
+                        with open('alexnet_full_surgical_search_result.json', 'w') as f_out:
+                            json.dump(best_config, f_out, indent=4)
+                    break 
                 else:
+                    # REJECTED: Staying at 8-bit or moving to next trial
                     if trial_bits == 4:
                         with open(log_path, 'a', newline='') as f:
-                            csv.writer(f).writerow([layer_name, g, f"{start_f}-{end_f-1}", trial_bits, acc, total_drop, "REJECTED", 0])
+                            csv.writer(f).writerow([layer_name, "N/A", i, "REJECTED", acc, total_drop, "REJECTED", 0])
+        
+        # Save after each layer completes
+        with open('alexnet_full_surgical_search_result.json', 'w') as f_out:
+            json.dump(best_config, f_out, indent=4)
 
     # Final Summary
     with open('alexnet_full_surgical_search_result.json', 'w') as f:

@@ -1,0 +1,69 @@
+# Model files (PyTorch)
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+*.onnx
+
+checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Data files
+*.csv
+*.h5
+*.hdf5
+data/
+datasets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+runs/
+wandb/
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+
+
+D:/Prune_2/models/*.pth
+D:/Prune_2/models/*.pt
+D:/Prune_2/models/*.ckpt
+
+VIT/
+Workflow.txt

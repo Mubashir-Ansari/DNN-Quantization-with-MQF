@@ -5,7 +5,7 @@ import os
 import csv
 
 # Global Scale Transceiver for Hardware-Fidelity Pipeline
-MQF_GLOBAL_CONTEXT = {'last_scale': 1.0}
+MQF_GLOBAL_CONTEXT = {'last_scale': 1.0, 'is_first_layer': True}
 
 class MQFLayerWrapper(nn.Module):
     """
@@ -59,9 +59,10 @@ class MQFLayerWrapper(nn.Module):
         self.S = self.S.to(device)
         
         # 1. Input Quantization (Simulate FPGA streaming input or calibrate first layer)
-        if not x_in.is_floating_point():
+        if not MQF_GLOBAL_CONTEXT.get('is_first_layer', True):
             # Use global transceiver for scale continuity across layers
             self.input_scale = MQF_GLOBAL_CONTEXT['last_scale']
+            self.input_zero_point = 0 
             x_int = x_in
         else:
             # First layer dynamic calibration
@@ -71,13 +72,18 @@ class MQFLayerWrapper(nn.Module):
                 self.input_scale = (x_max - x_min) / (qx_max - qx_min) if x_max > x_min else 1e-9
                 self.input_zero_point = torch.round(qx_min - x_min / self.input_scale)
                 x_int = torch.round(x_in / self.input_scale + self.input_zero_point).clamp(qx_min, qx_max)
+            # Lock calibration for subsequent layers
+            MQF_GLOBAL_CONTEXT['is_first_layer'] = False
 
+        # 2. Weights and MAC computation
         w = self.layer.weight.data
         out_ch = w.shape[0]
         unique_bits = sorted(list(set(self.bit_widths.tolist())))
         
-        # Accumulate results
-        final_output_q = None 
+        # Buffer to store intermediate integer results and their scales
+        groups_data = [] 
+        global_max_float = 0.0
+        final_output_q = None
 
         for b in unique_bits:
             mask = (self.bit_widths == b)
@@ -85,7 +91,7 @@ class MQFLayerWrapper(nn.Module):
             indices = torch.where(mask)[0]
             w_b = w[indices]
             
-            # Weight Quantization
+            # Weight Quantization (Per-Filter Scaling)
             w_view = [indices.shape[0]] + [1] * (w.ndim - 1)
             qw_min, qw_max = - (1 << (b - 1)), (1 << (b - 1)) - 1
             w_abs = torch.abs(w_b).view(indices.shape[0], -1)
@@ -102,12 +108,7 @@ class MQFLayerWrapper(nn.Module):
             else:
                 acc_int32 = torch.nn.functional.linear(x_int - self.input_zero_point, w_int, bias=None)
             
-            # Dynamic Initialization of Output Tensor (Fix for Stride/Padding)
-            if final_output_q is None:
-                out_shape = [x_int.shape[0], out_ch] + list(acc_int32.shape[2:])
-                final_output_q = torch.zeros(out_shape, device=device)
-            
-            # Bias Add
+            # Bias Add (Integer Domain)
             if self.layer.bias is not None:
                 b_val = self.layer.bias[indices]
                 b_scale = (self.input_scale * w_scale).view(-1)
@@ -116,53 +117,69 @@ class MQFLayerWrapper(nn.Module):
                     acc_int32 += b_int32.view(1, indices.shape[0], 1, 1)
                 else:
                     acc_int32 += b_int32
-            
-            # Fixed-Point PPU (Hardware-Perfect Requantization)
-            # Correct Math: Y_int = round(Acc_int * (Sin * Sw / Sout))
-            # If Sout is calibrated to Acc_max * Sin * Sw / TargetRange, 
-            # then Multiplier M = TargetRange / Acc_max (Input/Weight scales cancel out!)
-            
-            acc_float = acc_int32.float()
-            dynamic_acc_max = acc_float.abs().max() 
-            
-            if dynamic_acc_max < 1e-6:
-                target_out_scale = self.input_scale 
-                M_float = torch.tensor(1.0, device=device)
-                target_range = 127 # Dummy for clamping
-            else:
-                target_b = b if self.joint else self.act_bit_width
-                target_range = (1 << (target_b - 1)) - 1
-                
-                # The "Natural" Multiplier for bit-packing
-                M_float = target_range / dynamic_acc_max
-                
-                # The "Real" Scale to propagate to the next layer
-                # Sout = (Acc_max * Sin * Sw) / TargetRange
-                target_out_scale = (dynamic_acc_max * self.input_scale * w_scale.view(-1).abs().max()) / target_range
-            
-            # Decide path: Strict Integer (Fixed-Point) vs. Floating-Point Bridge
-            USE_STRICT_INT = True 
-            if USE_STRICT_INT:
-                M_fixed = torch.round(M_float * 65536)
-                out_q = torch.round((acc_float * M_fixed) / 65536.0)
-            else:
-                out_q = torch.round(acc_float * M_float)
 
-            final_output_q[:, indices] = out_q.reshape(acc_int32.shape).clamp(-target_range-1, target_range)
+            # Find peak float magnitude for this group to determine global scale
+            # represented_float = acc_int32 * Sin * Sw
+            group_max_float = acc_int32.float().abs().max() * self.input_scale * w_scale.abs().max()
+            global_max_float = max(global_max_float, group_max_float.item())
+            
+            groups_data.append({
+                'indices': indices,
+                'acc_int32': acc_int32,
+                'w_scale': w_scale,
+                'b': b
+            })
 
-            # Audit
+        # 3. Unified Requantization (PPU)
+        # We need a single Sout for the entire layer to keep feature magnitudes consistent
+        max_target_b = max(unique_bits) if self.joint else self.act_bit_width
+        target_range_max = (1 << (max_target_b - 1)) - 1
+        
+        # Calculate Unified Output Scale
+        unified_out_scale = global_max_float / target_range_max if global_max_float > 1e-6 else self.input_scale
+        
+        # DEBUG: Check for magnitude collapse
+        if not hasattr(self, '_print_count'): self._print_count = 0
+        if self._print_count < 1:
+            print(f"[DEBUG {self.layer_name}] MaxFloat: {global_max_float:.4f}, Sout: {unified_out_scale:.6f}, Sin: {self.input_scale:.6f}")
+            self._print_count += 1
+
+        if final_output_q is None:
+            # First group defines the spatial shape
+            ref_acc = groups_data[0]['acc_int32']
+            out_shape = [x_int.shape[0], out_ch] + list(ref_acc.shape[2:])
+            final_output_q = torch.zeros(out_shape, device=device)
+
+        for group in groups_data:
+            indices = group['indices']
+            acc_int32 = group['acc_int32']
+            w_scale = group['w_scale']
+            b = group['b']
+            
+            # Multiplier to map from (Sin * Sw) domain to unified Sout domain
+            # M = (Sin * Sw) / Sout
+            M_float = (self.input_scale * w_scale.view(-1)) / unified_out_scale
+            M_float = M_float.view(1, -1, 1, 1) if acc_int32.ndim == 4 else M_float.view(1, -1)
+            
+            # Fixed-Point Multiplication (16-bit precision for M)
+            M_fixed = torch.round(M_float * 65536)
+            out_q = torch.round((acc_int32.float() * M_fixed) / 65536.0)
+            
+            # Clamp to the SPECIFIC bit-width of the filter
+            target_b = b if self.joint else self.act_bit_width
+            target_range = (1 << (target_b - 1)) - 1
+            final_output_q[:, indices] = out_q.clamp(-target_range-1, target_range)
+
+            # Audit Data Collection
             if hasattr(self, 'do_audit') and self.do_audit:
-                for idx_in_indices, filter_idx in enumerate(indices):
-                    f_idx = filter_idx.item()
-                    # Re-calculate float output for audit verification
-                    float_res = (acc_int32[0, idx_in_indices].float() * self.input_scale * w_scale[idx_in_indices].item()).mean().item()
-                    self._audit_data[f_idx] = {
-                        'val_int': acc_int32[0, idx_in_indices, 0, 0].item() if acc_int32.ndim==4 else acc_int32[0, idx_in_indices].item(),
-                        'w_scale': w_scale[idx_in_indices].item(),
+                for lookup_idx, f_idx in enumerate(indices):
+                    f_idx_item = f_idx.item()
+                    self._audit_data[f_idx_item] = {
+                        'val_int': acc_int32[0, lookup_idx].abs().max().item(),
+                        'w_scale': w_scale[lookup_idx].item(),
                         'x_scale': self.input_scale if isinstance(self.input_scale, float) else self.input_scale.item(),
-                        'w_max_int': w_int[idx_in_indices].abs().max().item(),
+                        'w_max_int': (w[f_idx_item] / w_scale[lookup_idx]).abs().max().item(),
                         'x_max_int': x_int.abs().max().item(),
-                        'float_out': float_res
                     }
 
         if hasattr(self, 'do_audit') and self.do_audit:
@@ -170,7 +187,7 @@ class MQFLayerWrapper(nn.Module):
             self.do_audit = False
             
         # Update global transceiver for next layer
-        MQF_GLOBAL_CONTEXT['last_scale'] = target_out_scale
+        MQF_GLOBAL_CONTEXT['last_scale'] = unified_out_scale
         return final_output_q
 
     def _audit_math(self, K):

@@ -43,6 +43,7 @@ class AlexNet(nn.Module):
         # Reset Global MQF Scale Transceiver for new batch
         from quantization.register_aware_executor import MQF_GLOBAL_CONTEXT
         MQF_GLOBAL_CONTEXT['last_scale'] = 1.0
+        MQF_GLOBAL_CONTEXT['is_first_layer'] = True
         
         out = self.conv1(x)
         out = self.conv2(out)

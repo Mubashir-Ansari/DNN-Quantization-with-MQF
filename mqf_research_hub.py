@@ -66,6 +66,10 @@ def run_strategic_simulation(config, args):
         except KeyError:
             continue
             
+        if not hasattr(wrapper, 'layer'):
+            print(f"{name:<12} | {'N/A':>6} | {'N/A':>6} | {'N/A':>6} | {'N/A':<8} | {'FLOAT'}")
+            continue
+
         actual_layer = wrapper.layer
         w = actual_layer.weight.data
         out_ch = w.shape[0]

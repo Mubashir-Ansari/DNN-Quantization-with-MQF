@@ -5,6 +5,7 @@ import sys
 import argparse
 import csv
 from tqdm import tqdm
+import math
 
 # Add framework to path
 sys.path.append(os.path.join(os.getcwd(), 'quantization_framework'))

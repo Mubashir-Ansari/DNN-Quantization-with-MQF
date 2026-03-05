@@ -86,8 +86,20 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
     if os.path.exists(ckpt_to_load):
         print(f"Loading checkpoint from {ckpt_to_load}")
         try:
+            # Handle cases where 'quanto' is nested under 'optimum' (fixing SSH/VM issues)
+            try:
+                import quanto
+            except ImportError:
+                try:
+                    import optimum.quanto as quanto
+                    import sys
+                    sys.modules['quanto'] = quanto
+                    print("✓ Mapped 'optimum.quanto' to 'quanto' for compatibility")
+                except ImportError:
+                    pass
+
             # Load with weights_only=False because custom classes (fasion_mnist_alexnet) are common here
-            loaded = torch.load(ckpt_to_load, map_location='cpu')
+            loaded = torch.load(ckpt_to_load, map_location='cpu', weights_only=False)
             
             # CASE 1: Checkpoint IS a full model object (e.g. quanto/Pickled model)
             if isinstance(loaded, torch.nn.Module):

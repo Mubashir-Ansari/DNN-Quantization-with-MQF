@@ -75,6 +75,12 @@ class HybridQuantizer:
         self.packing_info: Dict = {}
         self.metrics: Dict = {}
         
+        # Robust State Backup (Deep Copy)
+        # We need this because Profiling modifies weight.data in-place
+        self.original_state_dict = {
+            n: p.data.clone().cpu() for n, p in model.named_parameters()
+        }
+        
         # Thresholds (expert-tuned)
         self.thresholds = {
             'tier1_threshold': 1.5,        # Drop_4bit > 1.5% → Sensitive tier
@@ -111,6 +117,7 @@ class HybridQuantizer:
         
         # Measure baseline accuracy
         baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
+        self.metrics['baseline_accuracy'] = baseline_acc
         print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
         # Profile each layer
@@ -167,9 +174,10 @@ class HybridQuantizer:
             reverse=True  # Highest first = most sensitive
         )
         
-        total_layers = len(layers_sorted)
-        tier1_count = max(1, int(total_layers * 0.30))
-        tier2_count = max(1, int(total_layers * 0.45))
+        # Categorize by Threshold instead of fixed percentages
+        # This ensures sensitive layers don't get forced into Tier 2 (4-bit)
+        tier1_threshold = self.thresholds.get('tier1_threshold', 3.0)
+        tier2_threshold = self.thresholds.get('tier2_threshold', 0.5)
         
         tiers = {
             'tier1_sensitive': [],
@@ -177,60 +185,49 @@ class HybridQuantizer:
             'tier3_insensitive': []
         }
         
-        config = {}
-        
-        # TIER 1: Sensitive (keep 8-bit)
-        for i in range(tier1_count):
-            layer_name, layer_drop = layers_sorted[i]
-            tiers['tier1_sensitive'].append(layer_name)
-            config[layer_name] = 8  # Uniform 8-bit
-            
-            assignment = TierAssignment(
-                layer_name=layer_name,
-                tier=1,
-                layer_drop_4bit=layer_drop[4],
-                layer_drop_2bit=layer_drop[2],
-                rationale="Sensitive: high precision needed at 4-bit"
-            )
-            self.tier_assignments.append(assignment)
-        
-        # TIER 2: Medium (force to 4-bit or conservative)
-        for i in range(tier1_count, tier1_count + tier2_count):
-            layer_name, layer_drop = layers_sorted[i]
-            tiers['tier2_medium'].append(layer_name)
-            
+        for layer_name, layer_drop in layers_sorted:
             drop_4 = layer_drop[4]
-            drop_2 = layer_drop[2]
             
-            # Greedy: Use 2-bit if safe, else 4-bit
-            if drop_2 < 0.3:  # Very conservative threshold
-                config[layer_name] = 2
-                reason = "2-bit safe (drop < 0.3%)"
+            if drop_4 > tier1_threshold:
+                tiers['tier1_sensitive'].append(layer_name)
+            elif drop_4 > tier2_threshold:
+                tiers['tier2_medium'].append(layer_name)
             else:
-                config[layer_name] = 4
-                reason = "4-bit default (medium sensitivity)"
-            
+                tiers['tier3_insensitive'].append(layer_name)
+
+        config = {}
+        total_layers = len(layers_sorted)
+        
+        # TIER 1: Sensitive (Keep 8-bit)
+        for layer_name in tiers['tier1_sensitive']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 8
             assignment = TierAssignment(
-                layer_name=layer_name,
-                tier=2,
-                layer_drop_4bit=drop_4,
-                layer_drop_2bit=drop_2,
-                rationale=reason
+                layer_name=layer_name, tier=1,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Sensitive (drop {layer_drop[4]:.2f}% > {tier1_threshold}%)"
             )
             self.tier_assignments.append(assignment)
-        
-        # TIER 3: Insensitive (placeholder for granular)
-        for i in range(tier1_count + tier2_count, total_layers):
-            layer_name, layer_drop = layers_sorted[i]
-            tiers['tier3_insensitive'].append(layer_name)
-            config[layer_name] = 4  # Will be refined (placeholder)
             
+        # TIER 2: Medium (4-bit default)
+        for layer_name in tiers['tier2_medium']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 4
             assignment = TierAssignment(
-                layer_name=layer_name,
-                tier=3,
-                layer_drop_4bit=layer_drop[4],
-                layer_drop_2bit=layer_drop[2],
-                rationale="Insensitive: candidate for granular optimization"
+                layer_name=layer_name, tier=2,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Medium (drop {layer_drop[4]:.2f}% > {tier2_threshold}%)"
+            )
+            self.tier_assignments.append(assignment)
+
+        # TIER 3: Insensitive (Granular candidate)
+        for layer_name in tiers['tier3_insensitive']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 4 # Placeholder for Refinement
+            assignment = TierAssignment(
+                layer_name=layer_name, tier=3,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Insensitive (drop {layer_drop[4]:.2f}% <= {tier2_threshold}%)"
             )
             self.tier_assignments.append(assignment)
         
@@ -475,9 +472,11 @@ class HybridQuantizer:
         print("[STAGE 5] VALIDATION & QAT RECOVERY")
         print("="*80)
         
-        # Baseline accuracy
-        baseline_acc = self._evaluate_accuracy_model(model_baseline, dataloader, 
-                                                    device=device, samples=samples)
+        # Use previously saved baseline instead of re-evaluating potentially modified model
+        baseline_acc = self.metrics.get('baseline_accuracy', 0.0)
+        if baseline_acc == 0:
+             baseline_acc = self._evaluate_accuracy_model(model_baseline, dataloader, 
+                                                         device=device, samples=samples)
         print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
         # Apply PTQ with config
@@ -625,10 +624,10 @@ class HybridQuantizer:
         w[filter_idx] = w_f_dequant
     
     def _restore_layer(self, layer_name: str):
-        """Reload original weights (undo quantization)"""
+        """Reload original weights from deep copy"""
         module = self._get_module(layer_name)
-        original_w = self.model.state_dict()[f"{layer_name}.weight"]
-        module.weight.data = original_w.clone()
+        orig_data = self.original_state_dict[f"{layer_name}.weight"].to(self.device)
+        module.weight.data = orig_data.clone()
     
     def _restore_filter(self, layer_name: str, filter_idx: int):
         """Restore specific filter"""

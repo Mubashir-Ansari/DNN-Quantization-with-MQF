@@ -5,6 +5,22 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.getenv('MODELS_DIR', os.path.join(PROJECT_ROOT, '../models'))
 
+# --- GLOBAL SHIM FOR QUANTO (Fixes SSH/VM registration issues) ---
+import sys
+try:
+    import quanto
+except ImportError:
+    try:
+        import optimum.quanto as quanto
+        sys.modules['quanto'] = quanto
+        # Recursively map submodules to ensure PyTorch unpickling works
+        import optimum.quanto.tensor
+        sys.modules['quanto.tensor'] = sys.modules['optimum.quanto.tensor']
+        print("✓ Mapped 'optimum.quanto' to 'quanto' globally for VM compatibility")
+    except ImportError:
+        pass
+# -----------------------------------------------------------------
+
 def get_model_size_info(model, checkpoint_path=None):
     """
     Calculate model size in MB.
@@ -86,18 +102,6 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
     if os.path.exists(ckpt_to_load):
         print(f"Loading checkpoint from {ckpt_to_load}")
         try:
-            # Handle cases where 'quanto' is nested under 'optimum' (fixing SSH/VM issues)
-            try:
-                import quanto
-            except ImportError:
-                try:
-                    import optimum.quanto as quanto
-                    import sys
-                    sys.modules['quanto'] = quanto
-                    print("✓ Mapped 'optimum.quanto' to 'quanto' for compatibility")
-                except ImportError:
-                    pass
-
             # Load with weights_only=False because custom classes (fasion_mnist_alexnet) are common here
             loaded = torch.load(ckpt_to_load, map_location='cpu', weights_only=False)
             
@@ -129,14 +133,14 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
                 
                 final_state_dict = {}
                 
-                # First, identify and dequantize quanto weights
+                # First, identify and dequantize 8-bit weights for comparison
                 quanto_bases = set()
                 for k in cleaned_state_dict.keys():
                     if k.endswith('.weight._data'):
                         quanto_bases.add(k[:-13])
                 
                 if quanto_bases:
-                    print(f"Dequantizing weights for {len(quanto_bases)} layers from quanto format...")
+                    print(f"Restoring 8-bit weights for {len(quanto_bases)} layers (for MQF Baseline)...")
                     for k, v in cleaned_state_dict.items():
                         is_processed = False
                         for base in quanto_bases:

@@ -111,7 +111,7 @@ class HybridQuantizer:
         
         # Measure baseline accuracy
         baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
-        print(f"\nBaseline Accuracy (FP32): {baseline_acc:.2f}%")
+        print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
         # Profile each layer
         for layer_name in tqdm(layers, desc="Layer Profiling"):
@@ -476,9 +476,9 @@ class HybridQuantizer:
         print("="*80)
         
         # Baseline accuracy
-        baseline_acc = self._evaluate_accuracy_model(model_fp32, dataloader, 
+        baseline_acc = self._evaluate_accuracy_model(model_baseline, dataloader, 
                                                     device=device, samples=samples)
-        print(f"\nBaseline Accuracy (FP32): {baseline_acc:.2f}%")
+        print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
         # Apply PTQ with config
         model_quantized = self._apply_tier_quantization(self.model, self.final_config)
@@ -757,7 +757,7 @@ class HybridQuantizer:
 # ║ END-TO-END EXECUTION FUNCTION                                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-def run_hybrid_tier_quantization(model_fp32, dataloader, device='cuda',
+def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
                                 output_dir='results'):
     """
     Complete hybrid tier quantization pipeline
@@ -772,7 +772,7 @@ def run_hybrid_tier_quantization(model_fp32, dataloader, device='cuda',
     print("█"*80)
     
     # Initialize
-    quantizer = HybridQuantizer(model_fp32, device=device, register_width=16)
+    quantizer = HybridQuantizer(model_baseline, device=device, register_width=16)
     
     # Timing
     start_time = time.time()
@@ -795,7 +795,7 @@ def run_hybrid_tier_quantization(model_fp32, dataloader, device='cuda',
     
     # Stage 5
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 5...")
-    metrics = quantizer.stage5_validation_and_qat(model_fp32, dataloader, device)
+    metrics = quantizer.stage5_validation_and_qat(model_baseline, dataloader, device)
     
     total_time = time.time() - start_time
     

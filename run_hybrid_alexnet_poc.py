@@ -78,14 +78,14 @@ def main():
     device = CONFIG['device']
     print(f"Device: {device}")
     
-    model_fp32 = load_model(
+    model_8bit = load_model(
         CONFIG['model_name'],
         checkpoint_path=CONFIG['checkpoint_path'],
         num_classes=CONFIG['num_classes']
     )
-    model_fp32.to(device)
-    model_fp32.eval()
-    print(f"✓ Loaded: {CONFIG['model_name']} from {CONFIG['checkpoint_path']}")
+    model_8bit.to(device)
+    model_8bit.eval()
+    print(f"✓ Loaded: {CONFIG['model_name']} (8-bit Baseline) from {CONFIG['checkpoint_path']}")
     
     # Load data
     dataloader = get_fashionmnist_dataloader(
@@ -104,7 +104,7 @@ def main():
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     
     quantizer = run_hybrid_tier_quantization(
-        model_fp32=model_fp32,
+        model_baseline=model_8bit,
         dataloader=dataloader,
         device=device,
         output_dir=CONFIG['output_dir']
@@ -157,7 +157,7 @@ def generate_performance_report(quantizer, config):
         'optimization_strategy': 'Hybrid Tier Quantization',
         
         'accuracy': {
-            'baseline_fp32_percent': quantizer.metrics['baseline_accuracy'],
+            'baseline_8bit_percent': quantizer.metrics['baseline_accuracy'],
             'final_quantized_percent': quantizer.metrics['final_accuracy'],
             'drop_percent': quantizer.metrics['accuracy_drop_percent'],
             'target_drop_percent': config['target_accuracy_drop'],

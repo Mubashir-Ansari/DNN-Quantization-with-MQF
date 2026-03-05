@@ -376,6 +376,8 @@ class HybridQuantizer:
         total_registers_mqf = 0
         total_registers_8bit_baseline = 0
         total_params = 0
+        total_bits_mqf = 0
+        total_bits_8bit = 0
         total_efficiency = 0
         layer_count = 0
         
@@ -414,6 +416,8 @@ class HybridQuantizer:
                 
                 total_registers_mqf += registers_needed
                 total_params += w.numel()
+                total_bits_mqf += (w.numel() * bit_width)
+                total_bits_8bit += (w.numel() * 8)
                 total_efficiency += utilization
                 layer_count += 1
                 
@@ -444,6 +448,8 @@ class HybridQuantizer:
                 avg_utilization = layer_utilization / len(bit_widths)
                 total_registers_mqf += layer_registers
                 total_params += w.numel()
+                total_bits_mqf += sum(b * (w.numel() // len(bit_widths)) for b in bit_widths)
+                total_bits_8bit += (w.numel() * 8)
                 total_efficiency += avg_utilization
                 layer_count += 1
                 
@@ -465,6 +471,7 @@ class HybridQuantizer:
         self.metrics['registers_baseline'] = total_registers_8bit_baseline
         self.metrics['registers_mqf'] = total_registers_mqf
         self.metrics['register_savings_percent'] = (1 - total_registers_mqf/total_registers_8bit_baseline) * 100
+        self.metrics['average_bits'] = total_bits_mqf / total_params if total_params > 0 else 8
         
         # Print summary
         avg_efficiency = total_efficiency / layer_count
@@ -532,8 +539,7 @@ class HybridQuantizer:
             'used_qat': used_qat,
             'target_drop_percent': target_drop
         }
-        
-        self.metrics = metrics
+        self.metrics.update(metrics)
         
         return metrics
     

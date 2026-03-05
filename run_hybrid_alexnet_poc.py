@@ -138,12 +138,12 @@ def main():
 def generate_performance_report(quantizer, config):
     """Generate comprehensive performance report"""
     
-    # Calculate compression
+    # Calculate compression using high-fidelity metrics from quantizer
     # Assume AlexNet baseline: 225MB @ 8-bit FP32
     baseline_size_mb = 225.0
-    avg_bits = calculate_average_bits(quantizer.final_config)
+    avg_bits = quantizer.metrics.get('average_bits', 8.0)
     quantized_size_mb = baseline_size_mb * (avg_bits / 32)
-    compression_ratio = 32 / avg_bits
+    compression_ratio = 32 / avg_bits if avg_bits > 0 else 4.0
     
     # Calculate BOPs reduction
     # AlexNet: ~710M BOPs @ 8-bit

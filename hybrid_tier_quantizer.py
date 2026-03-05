@@ -471,8 +471,8 @@ class HybridQuantizer:
         
         print(f"\n[PACKING SUMMARY]")
         print(f"Total Parameters:          {total_params:,}")
-        print(f"Total 16-bit Registers:    {total_registers:,}")
-        print(f"Avg Registers/Param:       {total_registers / total_params:.3f}")
+        print(f"Total 16-bit Registers:    {total_registers_mqf:,}")
+        print(f"Avg Registers/Param:       {total_registers_mqf / total_params:.3f}")
         print(f"Overall Register Utilization: {avg_efficiency:.1f}%")
         
         return packing_info

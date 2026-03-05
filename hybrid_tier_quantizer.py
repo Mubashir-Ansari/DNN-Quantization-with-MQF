@@ -464,7 +464,7 @@ class HybridQuantizer:
     # STAGE 5: VALIDATION & QAT
     # ══════════════════════════════════════════════════════════════════════════
     
-    def stage5_validation_and_qat(self, model_fp32, dataloader, 
+    def stage5_validation_and_qat(self, model_baseline, dataloader, 
                                   device, samples=1000,
                                   qat_threshold=2.0, target_drop=3.0):
         """

@@ -46,7 +46,7 @@ CONFIG = {
     # Optimization
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'register_width': 16,
-    'target_accuracy_drop': 3.0,
+    'target_accuracy_drop': 5.0,
     'qat_threshold': 2.0,
     
     # Sampling (for speed in development)
@@ -184,7 +184,10 @@ def generate_performance_report(quantizer, config):
         
         'hardware': {
             'register_width_bits': config['register_width'],
-            'register_utilization_percent': 85.5,  # From packing analysis
+            'registers_baseline': quantizer.metrics.get('registers_baseline', 0),
+            'registers_mqf': quantizer.metrics.get('registers_mqf', 0),
+            'register_savings_percent': quantizer.metrics.get('register_savings_percent', 0),
+            'register_utilization_percent': (sum(p['utilization_percent'] for p in quantizer.packing_info.values()) / len(quantizer.packing_info)) if quantizer.packing_info else 0,
             'bops_baseline': baseline_bops,
             'bops_quantized': quantized_bops,
             'bops_reduction': bops_reduction,

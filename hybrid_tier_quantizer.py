@@ -81,15 +81,15 @@ class HybridQuantizer:
             n: p.data.clone().cpu() for n, p in model.named_parameters()
         }
         
-        # Thresholds (expert-tuned)
+        # Thresholds (Tuned for 5% Thesis Target)
         self.thresholds = {
-            'tier1_threshold': 1.5,        # Drop_4bit > 1.5% → Sensitive tier
-            'tier2_threshold': 0.5,        # Drop_4bit > 0.5% → Medium tier
-            'filter_robust_percentile': 0.70,  # Bottom 70% = "robust"
-            'filter_2bit_threshold': 0.15,     # Drop <= 0.15% → can use 2-bit
-            'filter_4bit_default': 0.5,        # Drop <= 0.5% → safe 4-bit
-            'carry_bits_2bit': 3,              # Allocate 3 bits for 2-bit carry
-            'carry_bits_4bit': 4,              # Allocate 4 bits for 4-bit carry
+            'tier1_threshold': 5.0,            # Drop_4bit > 5.0% → Tier 1 (8-bit)
+            'tier2_threshold': 2.0,            # Drop_4bit > 2.0% → Tier 2 (4-bit)
+            'filter_robust_percentile': 0.70,  # Bottom 70% = candidate for 2-bit
+            'filter_2bit_threshold': 1.0,      # If filter-drop <= 1%, use 2-bit
+            'filter_4bit_threshold': 3.0,      # If filter-drop <= 3%, use 4-bit
+            'carry_bits_2bit': 3,
+            'carry_bits_4bit': 4,
         }
     
     # ══════════════════════════════════════════════════════════════════════════
@@ -175,9 +175,8 @@ class HybridQuantizer:
         )
         
         # Categorize by Threshold instead of fixed percentages
-        # This ensures sensitive layers don't get forced into Tier 2 (4-bit)
-        tier1_threshold = self.thresholds.get('tier1_threshold', 3.0)
-        tier2_threshold = self.thresholds.get('tier2_threshold', 0.5)
+        tier1_threshold = self.thresholds['tier1_threshold']
+        tier2_threshold = self.thresholds['tier2_threshold']
         
         tiers = {
             'tier1_sensitive': [],
@@ -304,25 +303,37 @@ class HybridQuantizer:
             robust_threshold = int(num_filters * self.thresholds['filter_robust_percentile'])
             filter_bits = [8] * num_filters  # Default
             
+            # Stage 3 MQF Logic: 2-bit, 4-bit, or 8-bit
             for rank, (f_idx, mag) in enumerate(filter_magnitudes):
                 if rank < robust_threshold:
-                    # Robust filter → try 2-bit
+                    # Robust filter → start with 2-bit
                     filter_bits[f_idx] = 2
                 else:
-                    # Keep 4-bit (borderline)
+                    # Medium sensitivity → start with 4-bit
                     filter_bits[f_idx] = 4
             
             # Optional: Verify top-5 robust ones with quick profiling
             top_robust_indices = [f[0] for f in filter_magnitudes[:5]]
             
             for f_idx in top_robust_indices:
+                # Profile filter to see if 2-bit or 4-bit is actually safe
                 self._apply_filter_quantization(layer_name, f_idx, bits=2)
-                acc = self._evaluate_accuracy(dataloader, samples=64)  # Fast
-                drop = baseline_acc - acc
+                acc_2b = self._evaluate_accuracy(dataloader, samples=64)
+                drop_2b = baseline_acc - acc_2b
                 
-                if drop > self.thresholds['filter_2bit_threshold']:
-                    # Revert to 4-bit if not safe
-                    filter_bits[f_idx] = 4
+                if drop_2b > self.thresholds['filter_2bit_threshold']:
+                    # 2-bit failed → try 4-bit
+                    self._apply_filter_quantization(layer_name, f_idx, bits=4)
+                    acc_4b = self._evaluate_accuracy(dataloader, samples=64)
+                    drop_4b = baseline_acc - acc_4b
+                    
+                    if drop_4b > self.thresholds['filter_4bit_threshold']:
+                        # 4-bit also failed! → Keep 8-bit for this specific filter
+                        filter_bits[f_idx] = 8
+                    else:
+                        filter_bits[f_idx] = 4
+                else:
+                    filter_bits[f_idx] = 2
                 
                 self._restore_filter(layer_name, f_idx)
             
@@ -333,7 +344,7 @@ class HybridQuantizer:
             count_4b = sum(1 for b in filter_bits if b == 4)
             count_8b = sum(1 for b in filter_bits if b == 8)
             
-            logger.info(f"{layer_name}: 2-bit={count_2b}, 4-bit={count_4b}, 8-bit={count_8b}")
+            print(f"INFO: {layer_name}: 2-bit={count_2b}, 4-bit={count_4b}, 8-bit={count_8b}")
         
         # Merge granular config into main config
         for layer_name, filter_bits in granular_configs.items():
@@ -362,7 +373,8 @@ class HybridQuantizer:
         print("="*80)
         
         packing_info = {}
-        total_registers = 0
+        total_registers_mqf = 0
+        total_registers_8bit_baseline = 0
         total_params = 0
         total_efficiency = 0
         layer_count = 0
@@ -373,11 +385,16 @@ class HybridQuantizer:
             num_filters = w.shape[0]
             params_per_filter = w[0].numel()
             
+            # Calculate Baseline (8-bit uniform) for comparison
+            # In a 16-bit register, 8-bit takes 2 slots
+            baseline_regs_layer = num_filters * math.ceil(params_per_filter / 2)
+            total_registers_8bit_baseline += baseline_regs_layer
+
             if isinstance(layer_config, int):
                 # Uniform bit-width (Tier 1 or 2)
                 bit_width = layer_config
                 
-                # Calculate registers
+                # Calculate registers for current config
                 registers_needed = num_filters * math.ceil(
                     params_per_filter / (self.register_width / bit_width)
                 )
@@ -395,7 +412,7 @@ class HybridQuantizer:
                 else:
                     carry_bits = 0
                 
-                total_registers += registers_needed
+                total_registers_mqf += registers_needed
                 total_params += w.numel()
                 total_efficiency += utilization
                 layer_count += 1
@@ -425,7 +442,7 @@ class HybridQuantizer:
                     layer_utilization += util
                 
                 avg_utilization = layer_utilization / len(bit_widths)
-                total_registers += layer_registers
+                total_registers_mqf += layer_registers
                 total_params += w.numel()
                 total_efficiency += avg_utilization
                 layer_count += 1
@@ -445,6 +462,9 @@ class HybridQuantizer:
             packing_info.update(packing)
         
         self.packing_info = packing_info
+        self.metrics['registers_baseline'] = total_registers_8bit_baseline
+        self.metrics['registers_mqf'] = total_registers_mqf
+        self.metrics['register_savings_percent'] = (1 - total_registers_mqf/total_registers_8bit_baseline) * 100
         
         # Print summary
         avg_efficiency = total_efficiency / layer_count
@@ -724,32 +744,86 @@ class HybridQuantizer:
         print(f"  ├─ granular_filter_configs.json (Filter-level detail for Tier 3)")
         print(f"  ├─ tier_assignments.csv (Layer categorization)")
         print(f"  └─ metrics.json (Accuracy & compression metrics)")
-    
+
+    def get_hardware_stats(self) -> Dict:
+        """Calculate per-layer bit distribution and packing stats"""
+        stats = {}
+        for name, cfg in self.final_config.items():
+            module = self._get_module(name)
+            out_ch = self._get_num_filters(module)
+            
+            if isinstance(cfg, int):
+                # Uniform
+                bit_counts = {2: 0, 4: 0, 8: 0}
+                bit_counts[cfg] = 100.0
+                avg_pack = self.register_width / cfg
+                status = "UNIFORM"
+            else:
+                # Granular
+                bit_counts = {2: 0, 4: 0, 8: 0}
+                for b in cfg:
+                    bit_counts[b] = bit_counts.get(b, 0) + 1
+                
+                for b in bit_counts:
+                    bit_counts[b] = (bit_counts[b] / out_ch) * 100
+                
+                # For granular, average packing is tricky but we follow hub logic
+                avg_pack = self.packing_info[name]['registers'] / out_ch
+                status = "GRANULAR"
+                
+            stats[name] = {
+                '2b': bit_counts[2],
+                '4b': bit_counts[4],
+                '8b': bit_counts[8],
+                'pack': avg_pack,
+                'status': status
+            }
+        return stats
     def print_summary(self):
-        """Print detailed summary"""
+        """Print detailed summary in the user's requested format"""
         print("\n" + "="*80)
         print("HYBRID TIER QUANTIZATION - EXECUTION SUMMARY")
         print("="*80)
         
         print(f"\n[RESULTS]")
-        print(f"Baseline Accuracy:        {self.metrics['baseline_accuracy']:.2f}%")
-        print(f"Final Accuracy:           {self.metrics['final_accuracy']:.2f}%")
-        print(f"Accuracy Drop:            {self.metrics['accuracy_drop_percent']:.3f}%")
+        baseline_acc = self.metrics.get('baseline_accuracy', 0)
+        final_acc = self.metrics.get('final_accuracy', 0)
+        drop = self.metrics.get('accuracy_drop_percent', 0)
+        print(f"Baseline Accuracy:        {baseline_acc:.2f}%")
+        print(f"Final Accuracy:           {final_acc:.2f}%")
+        print(f"Accuracy Drop:            {drop:.3f}%")
         
-        print(f"\n[OPTIMIZATION]")
+        print(f"\n[ALGO REPORT: REGISTER-MISMATCH ANALYSIS]")
+        print(f"{'Layer':<15} | {'2b %':<6} | {'4b %':<6} | {'8b %':<6} | {'Pack (A)':<8} | {'Status'}")
+        print("-" * 80)
+        
+        stats = self.get_hardware_stats()
+        for name, s in stats.items():
+            print(f"{name:<15} | {s['2b']:>5.1f}% | {s['4b']:>5.1f}% | {s['8b']:>5.1f}% | {s['pack']:<8.1f} | {s['status']}")
+            
+        print("-" * 80)
+        
         tier1_count = len(self.tiers.get('tier1_sensitive', []))
         tier2_count = len(self.tiers.get('tier2_medium', []))
         tier3_count = len(self.tiers.get('tier3_insensitive', []))
+        
         print(f"Tier 1 Layers:            {tier1_count} (8-bit uniform)")
         print(f"Tier 2 Layers:            {tier2_count} (4-bit layer-wise)")
         print(f"Tier 3 Layers:            {tier3_count} (granular 2-4-8bit)")
         
-        print(f"\n[HARDWARE]")
-        avg_util = sum(p['utilization_percent'] 
-                      for p in self.packing_info.values()) / len(self.packing_info)
-        print(f"Register Utilization:     {avg_util:.1f}%")
-        print(f"Register Width:           {self.register_width}-bit")
+        print(f"\n[HARDWARE: 16-bit REGISTER PACKING]")
+        reg_baseline = self.metrics.get('registers_baseline', 0)
+        reg_mqf = self.metrics.get('registers_mqf', 0)
+        savings = self.metrics.get('register_savings_percent', 0)
         
+        print(f"Baseline Registers (8-bit): {reg_baseline:,}")
+        print(f"MQF Registers (Mixed):      {reg_mqf:,}")
+        print(f"Space Acquired (Savings):   {savings:.2f}%")
+        
+        avg_util = sum(p['utilization_percent'] 
+                      for p in self.packing_info.values()) / len(self.packing_info) if self.packing_info else 0
+        print(f"Register Utilization:       {avg_util:.1f}%")
+        print(f"Strategy:                   MQF Carry-Aware Packing (Accordion Flow)")
         print("="*80 + "\n")
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

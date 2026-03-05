@@ -107,7 +107,10 @@ def main():
         model_baseline=model_8bit,
         dataloader=dataloader,
         device=device,
-        output_dir=CONFIG['output_dir']
+        output_dir=CONFIG['output_dir'],
+        tier1_threshold=CONFIG['target_accuracy_drop'],
+        tier2_threshold=CONFIG['qat_threshold'],
+        register_width=CONFIG['register_width']
     )
     
     # Step 3: Generate report
@@ -321,6 +324,9 @@ if __name__ == "__main__":
     parser.add_argument('--compare', action='store_true', help='Show comparison of approaches')
     parser.add_argument('--output-dir', default='results/alexnet_hybrid', help='Output directory')
     parser.add_argument('--samples', type=int, default=256, help='Samples for profiling')
+    parser.add_argument('--target-drop', type=float, default=5.0, help='Max acceptable accuracy drop %')
+    parser.add_argument('--qat-threshold', type=float, default=2.0, help='Threshold to trigger QAT recovery %')
+    parser.add_argument('--register-width', type=int, default=16, choices=[16, 32], help='Hardware register width (16 or 32)')
     
     args = parser.parse_args()
     
@@ -330,6 +336,9 @@ if __name__ == "__main__":
         CONFIG['output_dir'] = args.output_dir
         CONFIG['stage1_samples'] = args.samples
         CONFIG['stage3_samples'] = args.samples
+        CONFIG['target_accuracy_drop'] = args.target_drop
+        CONFIG['qat_threshold'] = args.qat_threshold
+        CONFIG['register_width'] = args.register_width
         
         quantizer, report = main()
         

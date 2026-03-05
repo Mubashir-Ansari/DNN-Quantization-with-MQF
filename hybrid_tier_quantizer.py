@@ -63,7 +63,9 @@ class HybridQuantizer:
     """Main optimization framework"""
     
     def __init__(self, model: nn.Module, device: str = 'cuda', 
-                 register_width: int = 16):
+                 register_width: int = 16,
+                 tier1_threshold: float = 5.0,
+                 tier2_threshold: float = 2.0):
         self.model = model
         self.device = device
         self.register_width = register_width
@@ -81,13 +83,13 @@ class HybridQuantizer:
             n: p.data.clone().cpu() for n, p in model.named_parameters()
         }
         
-        # Thresholds (Tuned for 5% Thesis Target)
+        # Thresholds (Tuned by user config)
         self.thresholds = {
-            'tier1_threshold': 5.0,            # Drop_4bit > 5.0% → Tier 1 (8-bit)
-            'tier2_threshold': 2.0,            # Drop_4bit > 2.0% → Tier 2 (4-bit)
-            'filter_robust_percentile': 0.70,  # Bottom 70% = candidate for 2-bit
-            'filter_2bit_threshold': 1.0,      # If filter-drop <= 1%, use 2-bit
-            'filter_4bit_threshold': 3.0,      # If filter-drop <= 3%, use 4-bit
+            'tier1_threshold': tier1_threshold,    # Drop_4bit > threshold1 → Tier 1 (8-bit)
+            'tier2_threshold': tier2_threshold,    # Drop_4bit > threshold2 → Tier 2 (4-bit)
+            'filter_robust_percentile': 0.70,      # Bottom 70% = candidate for 2-bit
+            'filter_2bit_threshold': tier2_threshold / 2, # If filter-drop <= threshold/2, use 2-bit
+            'filter_4bit_threshold': tier2_threshold * 1.5, # If filter-drop <= threshold*1.5, use 4-bit
             'carry_bits_2bit': 3,
             'carry_bits_4bit': 4,
         }
@@ -837,7 +839,10 @@ class HybridQuantizer:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
-                                output_dir='results'):
+                                output_dir='results',
+                                tier1_threshold=5.0,
+                                tier2_threshold=2.0,
+                                register_width=16):
     """
     Complete hybrid tier quantization pipeline
     
@@ -851,7 +856,10 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     print("█"*80)
     
     # Initialize
-    quantizer = HybridQuantizer(model_baseline, device=device, register_width=16)
+    quantizer = HybridQuantizer(model_baseline, device=device, 
+                               register_width=register_width,
+                               tier1_threshold=tier1_threshold,
+                               tier2_threshold=tier2_threshold)
     
     # Timing
     start_time = time.time()

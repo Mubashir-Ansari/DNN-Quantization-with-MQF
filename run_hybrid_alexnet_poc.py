@@ -110,7 +110,10 @@ def main():
         output_dir=CONFIG['output_dir'],
         tier1_threshold=CONFIG['target_accuracy_drop'],
         tier2_threshold=CONFIG['qat_threshold'],
-        register_width=CONFIG['register_width']
+        register_width=CONFIG['register_width'],
+        stage1_samples=CONFIG['stage1_samples'],
+        stage3_samples=CONFIG['stage3_samples'],
+        stage5_samples=CONFIG['stage5_samples']
     )
     
     # Step 3: Generate report

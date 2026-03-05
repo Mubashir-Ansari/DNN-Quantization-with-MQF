@@ -842,7 +842,10 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
                                 output_dir='results',
                                 tier1_threshold=5.0,
                                 tier2_threshold=2.0,
-                                register_width=16):
+                                register_width=16,
+                                stage1_samples=256,
+                                stage3_samples=256,
+                                stage5_samples=1000):
     """
     Complete hybrid tier quantization pipeline
     
@@ -866,7 +869,7 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     
     # Stage 1
     print(f"\n[{time.time()-start_time:.1f}s] Starting Stage 1...")
-    quantizer.stage1_fast_layer_profiling(dataloader, samples=256)
+    quantizer.stage1_fast_layer_profiling(dataloader, samples=stage1_samples)
     
     # Stage 2
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 2...")
@@ -874,7 +877,7 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     
     # Stage 3
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 3...")
-    quantizer.stage3_selective_granular_refinement(dataloader, samples=256)
+    quantizer.stage3_selective_granular_refinement(dataloader, samples=stage3_samples)
     
     # Stage 4
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 4...")
@@ -882,7 +885,12 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     
     # Stage 5
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 5...")
-    metrics = quantizer.stage5_validation_and_qat(model_baseline, dataloader, device)
+    metrics = quantizer.stage5_validation_and_qat(
+        model_baseline, dataloader, device, 
+        samples=stage5_samples,
+        qat_threshold=tier2_threshold,
+        target_drop=tier1_threshold
+    )
     
     total_time = time.time() - start_time
     

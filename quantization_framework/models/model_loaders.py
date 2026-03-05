@@ -8,17 +8,23 @@ MODELS_DIR = os.getenv('MODELS_DIR', os.path.join(PROJECT_ROOT, '../models'))
 # --- GLOBAL SHIM FOR QUANTO (Fixes SSH/VM registration issues) ---
 import sys
 try:
+    # 1. Try to import real 'quanto' (from local path in requirements.txt)
     import quanto
-except ImportError:
+    # Verify it's actually loaded and not just an empty namespace
+    if hasattr(quanto, 'QBitsTensor'):
+        print("✓ Successfully loaded local 'quanto' (modified version).")
+    else:
+        raise ImportError
+except (ImportError, AttributeError):
+    # 2. Fallback shim for optimum-quanto if necessary
     try:
         import optimum.quanto as quanto
         sys.modules['quanto'] = quanto
-        # Recursively map submodules to ensure PyTorch unpickling works
         import optimum.quanto.tensor
         sys.modules['quanto.tensor'] = sys.modules['optimum.quanto.tensor']
         print("✓ Mapped 'optimum.quanto' to 'quanto' globally for VM compatibility")
     except ImportError:
-        pass
+        print("⚠ WARNING: 'quanto' library not found. Quantization loading may fail.")
 # -----------------------------------------------------------------
 
 def get_model_size_info(model, checkpoint_path=None):

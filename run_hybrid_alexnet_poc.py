@@ -33,7 +33,7 @@ from quantization_framework.evaluation.pipeline import (
 CONFIG = {
     # Model
     'model_name': 'alexnet',
-    'checkpoint_path': 'models/qalex-0-7-clean.pth',
+    'checkpoint_path': 'models/qalex-0-7.pth',
     'num_classes': 10,
     'input_size': 227,
     

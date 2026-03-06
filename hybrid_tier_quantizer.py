@@ -59,6 +59,30 @@ class RegisterPackingInfo:
     register_utilization: float  # Percentage
     carry_bits_allocated: int
 
+class ActivationQuantizer(nn.Module):
+    """
+    Quantizes activation tensors using symmetric quantization.
+    Applied in real-time via forward hook during inference.
+    """
+    def __init__(self, bit_width=8):
+        super().__init__()
+        self.bit_width = bit_width
+    
+    def forward(self, x):
+        if self.bit_width >= 8:
+            return x
+            
+        # Symmetric quantization
+        max_abs = x.abs().max()
+        qmax = (1 << (self.bit_width - 1)) - 1
+        
+        if max_abs > 0:
+            scale = max_abs / qmax
+            # Quantize and dequantize (Fake Quantization)
+            x_int = torch.round(x / scale).clamp(-qmax - 1, qmax)
+            return x_int * scale
+        return x
+
 class HybridQuantizer:
     """Main optimization framework"""
     
@@ -76,6 +100,7 @@ class HybridQuantizer:
         self.final_config: Dict = {}
         self.packing_info: Dict = {}
         self.metrics: Dict = {}
+        self.activation_hooks = []
         
         # Robust State Backup (Deep Copy)
         # We need this because Profiling modifies weight.data in-place
@@ -123,19 +148,19 @@ class HybridQuantizer:
         print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
         # Profile each layer
-        for layer_name in tqdm(layers, desc="Layer Profiling"):
+        for layer_name in tqdm(layers, desc="Layer Profiling (W=A)"):
             layer_sensitivity = {}
             
             for bits in bit_widths:
-                # Apply layer-wise quantization
-                self._apply_layer_quantization(layer_name, bits)
+                # Apply joint W=A quantization
+                self._apply_joint_quantization(layer_name, bits)
                 
                 # Measure accuracy drop
                 acc = self._evaluate_accuracy(dataloader, samples=samples)
                 drop = baseline_acc - acc
                 layer_sensitivity[bits] = drop
                 
-                # Restore layer
+                # Restore layer (removes hooks and restores weights)
                 self._restore_layer(layer_name)
             
             sensitivity[layer_name] = layer_sensitivity
@@ -318,14 +343,15 @@ class HybridQuantizer:
             top_robust_indices = [f[0] for f in filter_magnitudes[:5]]
             
             for f_idx in top_robust_indices:
-                # Profile filter to see if 2-bit or 4-bit is actually safe
-                self._apply_filter_quantization(layer_name, f_idx, bits=2)
+                # Profile filter to see if 2-bit or 4-bit is actually safe (W=A)
+                self._apply_joint_filter_quantization(layer_name, f_idx, bits=2)
                 acc_2b = self._evaluate_accuracy(dataloader, samples=64)
                 drop_2b = baseline_acc - acc_2b
                 
                 if drop_2b > self.thresholds['filter_2bit_threshold']:
                     # 2-bit failed → try 4-bit
-                    self._apply_filter_quantization(layer_name, f_idx, bits=4)
+                    self._restore_filter(layer_name, f_idx) # Clear 2-bit hook/weight
+                    self._apply_joint_filter_quantization(layer_name, f_idx, bits=4)
                     acc_4b = self._evaluate_accuracy(dataloader, samples=64)
                     drop_4b = baseline_acc - acc_4b
                     
@@ -494,11 +520,11 @@ class HybridQuantizer:
                                   device, samples=1000,
                                   qat_threshold=2.0, target_drop=3.0):
         """
-        STAGE 5: PTQ validation and optional QAT recovery
+        STAGE 5: PTQ validation and optional QAT recovery (W+A Joint)
         """
         
         print("\n" + "="*80)
-        print("[STAGE 5] VALIDATION & QAT RECOVERY")
+        print("[STAGE 5] VALIDATION & QAT RECOVERY (W=A)")
         print("="*80)
         
         # Use previously saved baseline instead of re-evaluating potentially modified model
@@ -508,8 +534,12 @@ class HybridQuantizer:
                                                          device=device, samples=samples)
         print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
-        # Apply PTQ with config
+        # 1. Apply PTQ with config (Weights)
         model_quantized = self._apply_tier_quantization(self.model, self.final_config)
+        
+        # 2. Add Activation Hooks for Final Inference
+        self._add_final_activation_hooks(model_quantized, self.final_config)
+        
         model_quantized.to(device)
         model_quantized.eval()
         
@@ -518,7 +548,7 @@ class HybridQuantizer:
                                                device=device, samples=samples)
         ptq_drop = baseline_acc - ptq_acc
         
-        print(f"PTQ Accuracy:             {ptq_acc:.2f}%")
+        print(f"PTQ Accuracy (Joint W=A):  {ptq_acc:.2f}%")
         print(f"Accuracy Drop (PTQ):      {ptq_drop:.3f}%")
         
         # Decision
@@ -621,7 +651,7 @@ class HybridQuantizer:
         return 100 * correct / total
     
     def _apply_layer_quantization(self, layer_name: str, bits: int):
-        """Quantize a layer uniformly"""
+        """Quantize a layer uniformly (Weights Only)"""
         module = self._get_module(layer_name)
         w = module.weight.data
         
@@ -634,15 +664,37 @@ class HybridQuantizer:
         w_dequant = w_int * scale
         
         module.weight.data = w_dequant
+
+    def _apply_joint_quantization(self, layer_name: str, bits: int):
+        """Quantize a layer Jointly (Weights + Activations)"""
+        # 1. Weight Quantization
+        self._apply_layer_quantization(layer_name, bits)
+        
+        # 2. Activation Quantization (via hook)
+        module = self._get_module(layer_name)
+        quantizer = ActivationQuantizer(bit_width=bits)
+        
+        def hook_fn(module, input, output):
+            return quantizer(output)
+            
+        handle = module.register_forward_hook(hook_fn)
+        self.activation_hooks.append((layer_name, handle))
+
+    def _clear_hooks(self):
+        """Remove all activation hooks"""
+        for layer_name, handle in self.activation_hooks:
+            handle.remove()
+        self.activation_hooks = []
     
     def _apply_filter_quantization(self, layer_name: str, filter_idx: int, 
                                   bits: int):
-        """Quantize a specific filter"""
+        """Quantize a specific filter (Weights Only)"""
         module = self._get_module(layer_name)
         w = module.weight.data
-        
-        qmax = (1 << (bits - 1)) - 1
         w_f = w[filter_idx]
+        
+        # Symmetric quantization
+        qmax = (1 << (bits - 1)) - 1
         w_f_max = torch.max(torch.abs(w_f))
         scale = w_f_max / qmax if w_f_max > 0 else 1.0
         
@@ -650,12 +702,75 @@ class HybridQuantizer:
         w_f_dequant = w_f_int * scale
         
         w[filter_idx] = w_f_dequant
+
+    def _apply_joint_filter_quantization(self, layer_name: str, filter_idx: int, bits: int):
+        """Quantize a specific filter Jointly (Weight + Activation Dispatch)"""
+        # 1. Weight
+        self._apply_filter_quantization(layer_name, filter_idx, bits)
+        
+        # 2. Activation Hook with Filter Dispatch
+        module = self._get_module(layer_name)
+        quantizer = ActivationQuantizer(bit_width=bits)
+        
+        def filter_dispatch_hook(module, input, output):
+            # output: [N, C, H, W]
+            # We ONLY quantize the specific channel (filter)
+            q_channel = quantizer(output[:, filter_idx:filter_idx+1, :, :])
+            output[:, filter_idx:filter_idx+1, :, :] = q_channel
+            return output
+            
+        handle = module.register_forward_hook(filter_dispatch_hook)
+        self.activation_hooks.append((layer_name, handle))
+
+    def _add_final_activation_hooks(self, model, config):
+        """Register hooks for final inference based on config"""
+        self._clear_hooks() # Reset
+        
+        for layer_name, layer_config in config.items():
+            module = self._get_module(layer_name)
+            
+            if isinstance(layer_config, int):
+                # Uniform Layer-wise Activation Hook
+                bits = layer_config
+                if bits >= 8: continue
+                
+                quantizer = ActivationQuantizer(bit_width=bits)
+                handle = module.register_forward_hook(lambda m, i, o, q=quantizer: q(o))
+                self.activation_hooks.append((layer_name, handle))
+            else:
+                # Granular Per-Filter Activation Dispatch
+                # We use a single hook per layer for efficiency but dispatch per filter
+                filter_bits = layer_config
+                unique_bits = sorted(list(set(filter_bits)))
+                
+                if all(b >= 8 for b in unique_bits): continue
+                
+                # Create quantizers for each bit-width present in this layer
+                quantizers = {b: ActivationQuantizer(bit_width=b) for b in unique_bits if b < 8}
+                
+                def layer_granular_hook(module, input, output, bits_map=filter_bits, qs=quantizers):
+                    for f_idx, b in enumerate(bits_map):
+                        if b < 8:
+                            output[:, f_idx:f_idx+1, :, :] = qs[b](output[:, f_idx:f_idx+1, :, :])
+                    return output
+                    
+                handle = module.register_forward_hook(layer_granular_hook)
+                self.activation_hooks.append((layer_name, handle))
     
     def _restore_layer(self, layer_name: str):
-        """Reload original weights from deep copy"""
+        """Reload original weights and remove specific layer hook"""
         module = self._get_module(layer_name)
         orig_data = self.original_state_dict[f"{layer_name}.weight"].to(self.device)
         module.weight.data = orig_data.clone()
+        
+        # Remove hook for this layer
+        new_hooks = []
+        for name, handle in self.activation_hooks:
+            if name == layer_name:
+                handle.remove()
+            else:
+                new_hooks.append((name, handle))
+        self.activation_hooks = new_hooks
     
     def _restore_filter(self, layer_name: str, filter_idx: int):
         """Restore specific filter"""

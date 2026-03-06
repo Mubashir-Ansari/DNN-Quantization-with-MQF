@@ -208,9 +208,9 @@ class HybridQuantizer:
         Formula: d * (2^x - 1) * (2^y - 1) < 2^(R/d)
         Optimized for 16-bit registers.
         """
-        if bits >= 8: return 1   # 8-bit: No packing for safety in 16-bit reg
-        if bits == 4: return 2   # 4-bit: 2 weights per 16-bit reg
-        if bits == 2: return 4   # 2-bit: 4 weights per 16-bit reg
+        if bits >= 8: return 2   # 8-bit: 2 weights per 16-bit reg (Risky for MAC, but matches baseline)
+        if bits == 4: return 4   # 4-bit: 4 weights per 16-bit reg
+        if bits == 2: return 8   # 2-bit: 8 weights per 16-bit reg
         return 1
 
     def _calculate_empty_bits(self, bits: int, d: int) -> int:
@@ -292,18 +292,23 @@ class HybridQuantizer:
         for layer in sensitivity.keys():
             config[layer] = max_bits
 
-        # Build layer priority list (least sensitive first)
+        # [Senior Refined Priority] Bang-for-Buck = (Drop_Reduction) / (Density_Gain)
+        # We want to flip layers that give most SIMD speedup for least accuracy loss.
+        d_factors = {b: self._calculate_max_packing_factor(b) for b in bit_choices}
+        
         layer_priority = []
         for layer, scores in sensitivity.items():
-            if max_bits in scores:
-                avg_sensitivity = scores[max_bits]
-            else:
-                available_sens = [v for k, v in scores.items() if isinstance(k, int)]
-                avg_sensitivity = sum(available_sens) / len(available_sens) if available_sens else 100.0
-            layer_priority.append((layer, avg_sensitivity))
+            # Sensitivity to 4-bit vs 8-bit
+            drop_8 = scores.get(8, 0.0)
+            drop_4 = scores.get(4, 1.0)
+            delta_drop = max(0.001, drop_4 - drop_8)
+            delta_density = d_factors[4] - d_factors[8]
+            
+            priority_score = delta_density / delta_drop
+            layer_priority.append((layer, priority_score))
 
-        layer_priority.sort(key=lambda x: x[1])
-
+        # Higher priority score (more bang for buck) first
+        layer_priority.sort(key=lambda x: x[1], reverse=True)
         estimated_drop = 0.0
         moves = []
         
@@ -375,16 +380,14 @@ class HybridQuantizer:
         for layer_name, bits in mqf_config.items():
             if bits == 8:
                 tiers['tier1_sensitive'].append(layer_name)
-            elif bits == 4:
-                # If it's 4-bit, we decide if it's Tier 2 or Tier 3
-                # Tier 3 are those that are particularly robust (low drop at 2-bit)
+            else:
+                # [Senior Broadening] Tier 3 includes ANY non-sensitive layer for refinement
+                # Tier 2 is just a middle-ground label. We prioritize Tier 3 to allow granular MQF.
                 drop_2 = self.layer_sensitivity[layer_name].get(2, 100.0)
-                if drop_2 < (target_drop / 2): # Heuristic for robustness
+                if drop_2 < (target_drop * 0.8): # Very broad Tier 3 inclusion
                     tiers['tier3_insensitive'].append(layer_name)
                 else:
                     tiers['tier2_medium'].append(layer_name)
-            else: # bits == 2
-                tiers['tier3_insensitive'].append(layer_name)
 
         config = {}
         

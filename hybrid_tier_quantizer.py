@@ -533,7 +533,7 @@ class HybridQuantizer:
     # STAGE 4: HARDWARE-AWARE REGISTER PACKING
     # ══════════════════════════════════════════════════════════════════════════
     
-    def stage4_record_packing(self):
+    def stage4_record_packing(self, dataloader):
         """
         STAGE 4: Analyze register packing efficiency
         
@@ -1184,8 +1184,7 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     
     # Stage 4
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 4...")
-    quantizer.stage4_record_packing()
-    
+    quantizer.stage4_record_packing(dataloader)
     # Stage 5
     print(f"[{time.time()-start_time:.1f}s] Starting Stage 5...")
     metrics = quantizer.stage5_validation_and_qat(

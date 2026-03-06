@@ -52,14 +52,20 @@ def verify_joint_wa_on_alexnet(config_path='results/alexnet_hybrid/hybrid_config
     
     for name, module in model.named_modules():
         if name in config:
-            # Check for forward hooks
-            hooks = list(module._forward_hooks.values())
-            hook_names = [h.__name__ if hasattr(h, '__name__') else str(h) for h in hooks]
+            # Robust Inspection of Hook Closures
+            has_wa_quant = False
+            for h in hooks:
+                # Check defaults (Lambda closure)
+                if hasattr(h, '__defaults__') and h.__defaults__:
+                    if any('ActivationQuantizer' in str(type(d)) for d in h.__defaults__):
+                        has_wa_quant = True
+                        break
+                # Check globals/closure (Function mapping)
+                if 'layer_granular_hook' in str(h) or 'filter_dispatch_hook' in str(h):
+                    has_wa_quant = True
+                    break
             
-            # Check for ActivationQuantizer in the hook closure
-            has_wa_quant = any('quantizer' in str(h) or 'ActivationQuantizer' in str(h) for h in hooks)
-            
-            status = "✅ ACTIVE (W=A)" if has_wa_quant else "❌ MISSING"
+            status = "✅ ACTIVE (Joint W=A)" if has_wa_quant else "❌ MISSING"
             if config[name] == 8:
                 status = "⚪ 8-BIT (Full Prec)"
             

@@ -53,6 +53,7 @@ def verify_joint_wa_on_alexnet(config_path='results/alexnet_hybrid/hybrid_config
     for name, module in model.named_modules():
         if name in config:
             # Robust Inspection of Hook Closures
+            hooks = list(module._forward_hooks.values())
             has_wa_quant = False
             for h in hooks:
                 # Check defaults (Lambda closure)

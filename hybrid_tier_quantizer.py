@@ -22,6 +22,75 @@ from dataclasses import dataclass, asdict
 import logging
 import time
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ MQF PRIMITIVES (Core Functions from joint_sensitivity.py)                 ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def quantize_tensor(x, bit_width=8, method='symmetric'):
+    """
+    Quantizes a tensor to a specific bit-width.
+    Ref: MQF codebase
+    """
+    if bit_width >= 32:
+        return x, 1.0, 0.0
+        
+    qmax = (1 << (bit_width - 1)) - 1
+    
+    if method == 'symmetric':
+        max_abs = x.abs().max()
+        if max_abs == 0:
+            return x, 1.0, 0.0
+        scale = max_abs / qmax
+        x_q = torch.round(x / scale).clamp(-qmax - 1, qmax)
+        return x_q * scale, scale, 0.0
+    else:
+        # Min-Max as fallback
+        xmin, xmax = x.min(), x.max()
+        if xmin == xmax:
+            return x, 1.0, 0.0
+        scale = (xmax - xmin) / (2 * qmax)
+        zero_point = torch.round((xmin + xmax) / 2)
+        x_q = torch.round((x - zero_point) / scale).clamp(-qmax - 1, qmax)
+        return x_q * scale + zero_point, scale, zero_point
+
+class JointQuantizer:
+    """Applies W=A quantization to a single layer (Formal MQF Implementation)"""
+
+    def __init__(self, layer_module, bit_width):
+        self.layer_module = layer_module
+        self.bit_width = bit_width
+        self.original_weight = None
+        self.hook_handle = None
+
+    def apply_weight_quantization(self):
+        """Quantize and replace layer weights."""
+        if hasattr(self.layer_module, 'weight') and self.layer_module.weight is not None:
+            # Save original weights
+            self.original_weight = self.layer_module.weight.data.clone()
+
+            # Quantize weights
+            w = self.layer_module.weight.data
+            q_w, _, _ = quantize_tensor(w, bit_width=self.bit_width, method='symmetric')
+            self.layer_module.weight.data = q_w
+
+    def setup_activation_quantization(self):
+        """Register forward hook to quantize activations."""
+        def quantize_hook(module, input, output):
+            q_output, _, _ = quantize_tensor(output, bit_width=self.bit_width, method='symmetric')
+            return q_output
+
+        self.hook_handle = self.layer_module.register_forward_hook(quantize_hook)
+
+    def restore(self):
+        """Restore original weights and remove activation hook."""
+        if self.original_weight is not None:
+            self.layer_module.weight.data = self.original_weight
+            self.original_weight = None
+
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
+            self.hook_handle = None
+
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -149,21 +218,26 @@ class HybridQuantizer:
         
         # Profile each layer
         for layer_name in tqdm(layers, desc="Layer Profiling (W=A)"):
-            layer_sensitivity = {}
+            layer_module = self._get_layer(layer_name)
+            layer_sensitivity_data = {}
             
             for bits in bit_widths:
-                # Apply joint W=A quantization
-                self._apply_joint_quantization(layer_name, bits)
+                # [MQF FIX] Use formal JointQuantizer
+                quantizer = JointQuantizer(layer_module, bits)
                 
-                # Measure accuracy drop
-                acc = self._evaluate_accuracy(dataloader, samples=samples)
-                drop = baseline_acc - acc
-                layer_sensitivity[bits] = drop
-                
-                # Restore layer (removes hooks and restores weights)
-                self._restore_layer(layer_name)
+                try:
+                    quantizer.apply_weight_quantization()
+                    quantizer.setup_activation_quantization()
+                    
+                    # Measure accuracy drop
+                    acc = self._evaluate_accuracy(dataloader, samples=samples)
+                    drop = baseline_acc - acc
+                    layer_sensitivity_data[bits] = drop
+                finally:
+                    quantizer.restore()
+                    torch.cuda.empty_cache()
             
-            sensitivity[layer_name] = layer_sensitivity
+            sensitivity[layer_name] = layer_sensitivity_data
         
         self.layer_sensitivity = sensitivity
         
@@ -173,37 +247,94 @@ class HybridQuantizer:
         print(f"  Bit-widths tested: {bit_widths}")
         
         return sensitivity
+
+    def greedy_joint_search(self, sensitivity, bit_choices, target_drop=3.0, baseline_acc=None):
+        """
+        Greedy search with W=A constraint (Formal MQF Implementation)
+        """
+        if baseline_acc is None:
+            baseline_acc = self.metrics.get('baseline_accuracy', 100.0)
+
+        bit_choices_sorted = sorted(bit_choices, reverse=True)
+        max_bits = bit_choices_sorted[0]
+
+        # Initialize all layers to max bits
+        config = {}
+        for layer in sensitivity.keys():
+            config[layer] = max_bits
+
+        # Build layer priority list (least sensitive first)
+        layer_priority = []
+        for layer, scores in sensitivity.items():
+            if max_bits in scores:
+                avg_sensitivity = scores[max_bits]
+            else:
+                available_sens = [v for k, v in scores.items() if isinstance(k, int)]
+                avg_sensitivity = sum(available_sens) / len(available_sens) if available_sens else 100.0
+            layer_priority.append((layer, avg_sensitivity))
+
+        layer_priority.sort(key=lambda x: x[1])
+
+        estimated_drop = 0.0
+        moves = []
+
+        for layer, _ in layer_priority:
+            current_bits = config[layer]
+            best_bits = current_bits
+
+            for bits in bit_choices_sorted:
+                if bits >= current_bits:
+                    continue
+
+                if bits in sensitivity[layer]:
+                    layer_drop = sensitivity[layer][bits]
+                else:
+                    continue
+
+                potential_drop = estimated_drop + layer_drop
+
+                if potential_drop <= target_drop:
+                    best_bits = bits
+                    estimated_drop = potential_drop
+                    moves.append({
+                        'layer': layer,
+                        'from': current_bits,
+                        'to': bits,
+                        'layer_drop': layer_drop,
+                        'cumulative_drop': estimated_drop
+                    })
+                    break
+
+            config[layer] = best_bits
+
+        return config, estimated_drop
     
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2: TIER CATEGORIZATION & CONFIG GENERATION
     # ══════════════════════════════════════════════════════════════════════════
     
-    def stage2_categorize_and_config(self):
+    def stage2_categorize_and_config(self, target_drop=3.0):
         """
-        STAGE 2: Categorize layers into tiers
+        STAGE 2: Categorize layers into tiers using MQF Greedy Search
         
-        Tier 1 (Sensitive, ~30%): Keep 8-bit uniform
-        Tier 2 (Medium, ~45%): Keep 4-bit uniform
-        Tier 3 (Insensitive, ~25%): Candidate for granular
+        Tier 1 (Sensitive): Sensitive layers assigned to 8-bit by global search.
+        Tier 2 (Medium): Layers where search found 4-bit acceptable.
+        Tier 3 (Insensitive): Candidate for granular refinement.
         """
         
         print("\n" + "="*80)
-        print("[STAGE 2] TIER CATEGORIZATION & CONFIG GENERATION")
+        print("[STAGE 2] TIER CATEGORIZATION & MQF CONFIG SEARCH")
         print("="*80)
         
         if not self.layer_sensitivity:
             raise ValueError("Run stage1_fast_layer_profiling first")
         
-        # Sort layers by 4-bit drop (sensitivity metric)
-        layers_sorted = sorted(
-            self.layer_sensitivity.items(),
-            key=lambda x: x[1][4],  # Sort by 4-bit drop
-            reverse=True  # Highest first = most sensitive
+        # Use formal MQF search logic
+        print(f"Running global joint W=A search (Target Drop: {target_drop}%)...")
+        bit_choices = [2, 4, 8]
+        mqf_config, estimated_drop = self.greedy_joint_search(
+            self.layer_sensitivity, bit_choices, target_drop=target_drop
         )
-        
-        # Categorize by Threshold instead of fixed percentages
-        tier1_threshold = self.thresholds['tier1_threshold']
-        tier2_threshold = self.thresholds['tier2_threshold']
         
         tiers = {
             'tier1_sensitive': [],
@@ -211,70 +342,58 @@ class HybridQuantizer:
             'tier3_insensitive': []
         }
         
-        for layer_name, layer_drop in layers_sorted:
-            drop_4 = layer_drop[4]
-            
-            if drop_4 > tier1_threshold:
+        for layer_name, bits in mqf_config.items():
+            if bits == 8:
                 tiers['tier1_sensitive'].append(layer_name)
-            elif drop_4 > tier2_threshold:
-                tiers['tier2_medium'].append(layer_name)
-            else:
+            elif bits == 4:
+                # If it's 4-bit, we decide if it's Tier 2 or Tier 3
+                # Tier 3 are those that are particularly robust (low drop at 2-bit)
+                drop_2 = self.layer_sensitivity[layer_name].get(2, 100.0)
+                if drop_2 < (target_drop / 2): # Heuristic for robustness
+                    tiers['tier3_insensitive'].append(layer_name)
+                else:
+                    tiers['tier2_medium'].append(layer_name)
+            else: # bits == 2
                 tiers['tier3_insensitive'].append(layer_name)
 
         config = {}
-        total_layers = len(layers_sorted)
         
-        # TIER 1: Sensitive (Keep 8-bit)
+        # TIER 1: Sensitive
         for layer_name in tiers['tier1_sensitive']:
-            layer_drop = self.layer_sensitivity[layer_name]
             config[layer_name] = 8
-            assignment = TierAssignment(
+            self.tier_assignments.append(TierAssignment(
                 layer_name=layer_name, tier=1,
-                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
-                rationale=f"Sensitive (drop {layer_drop[4]:.2f}% > {tier1_threshold}%)"
-            )
-            self.tier_assignments.append(assignment)
+                layer_drop_4bit=self.layer_sensitivity[layer_name][4],
+                layer_drop_2bit=self.layer_sensitivity[layer_name][2],
+                rationale="MQF Search: Sensitive (8-bit required)"
+            ))
             
-        # TIER 2: Medium (4-bit default)
+        # TIER 2: Medium
         for layer_name in tiers['tier2_medium']:
-            layer_drop = self.layer_sensitivity[layer_name]
             config[layer_name] = 4
-            assignment = TierAssignment(
+            self.tier_assignments.append(TierAssignment(
                 layer_name=layer_name, tier=2,
-                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
-                rationale=f"Medium (drop {layer_drop[4]:.2f}% > {tier2_threshold}%)"
-            )
-            self.tier_assignments.append(assignment)
+                layer_drop_4bit=self.layer_sensitivity[layer_name][4],
+                layer_drop_2bit=self.layer_sensitivity[layer_name][2],
+                rationale="MQF Search: Medium (4-bit optimal)"
+            ))
 
         # TIER 3: Insensitive (Granular candidate)
         for layer_name in tiers['tier3_insensitive']:
-            layer_drop = self.layer_sensitivity[layer_name]
-            config[layer_name] = 4 # Placeholder for Refinement
-            assignment = TierAssignment(
+            config[layer_name] = 4 # Default to 4, refined in Stage 3
+            self.tier_assignments.append(TierAssignment(
                 layer_name=layer_name, tier=3,
-                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
-                rationale=f"Insensitive (drop {layer_drop[4]:.2f}% <= {tier2_threshold}%)"
-            )
-            self.tier_assignments.append(assignment)
+                layer_drop_4bit=self.layer_sensitivity[layer_name][4],
+                layer_drop_2bit=self.layer_sensitivity[layer_name][2],
+                rationale="MQF Search: Robust (Tier 3 Granular Candidate)"
+            ))
         
-        # Print summary
-        print(f"\n[TIER BREAKDOWN]")
-        print(f"Tier 1 (Sensitive):     {len(tiers['tier1_sensitive']):2d} layers → 8-bit uniform")
-        for layer in tiers['tier1_sensitive']:
-            drop = self.layer_sensitivity[layer][4]
-            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
-        
-        print(f"\nTier 2 (Medium):        {len(tiers['tier2_medium']):2d} layers → layer-wise 4-bit")
-        for layer in tiers['tier2_medium'][:3]:
-            drop = self.layer_sensitivity[layer][4]
-            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
-        if len(tiers['tier2_medium']) > 3:
-            print(f"  └─ ... +{len(tiers['tier2_medium'])-3} more")
-        
-        print(f"\nTier 3 (Insensitive):   {len(tiers['tier3_insensitive']):2d} layers → GRANULAR refinement")
-        for layer in tiers['tier3_insensitive']:
-            drop = self.layer_sensitivity[layer][4]
-            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
+        # Summary
+        print(f"\n[TIER BREAKDOWN - MQF INFORMED]")
+        print(f"Estimated search drop: {estimated_drop:.2f}%")
+        print(f"Tier 1 (Sensitive):     {len(tiers['tier1_sensitive']):2d} layers → 8-bit")
+        print(f"Tier 2 (Medium):        {len(tiers['tier2_medium']):2d} layers → 4-bit")
+        print(f"Tier 3 (Insensitive):   {len(tiers['tier3_insensitive']):2d} layers → Refine to 2-bit")
         
         self.final_config = config
         self.tiers = tiers

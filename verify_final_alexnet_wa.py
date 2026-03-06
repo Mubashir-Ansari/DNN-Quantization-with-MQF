@@ -7,7 +7,7 @@ import sys
 sys.path.append(os.path.join(os.getcwd(), 'quantization_framework'))
 
 from models.model_loaders import load_model
-from hybrid_tier_quantizer import HybridQuantizer
+from hybrid_tier_quantizer-new import HybridQuantizer
 
 def verify_joint_wa_on_alexnet(config_path='results/alexnet_hybrid/hybrid_config.json'):
     print("\n" + "="*80)

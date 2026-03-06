@@ -348,7 +348,7 @@ class HybridQuantizer:
     # STAGE 2: TIER CATEGORIZATION & CONFIG GENERATION
     # ══════════════════════════════════════════════════════════════════════════
     
-    def stage2_categorize_and_config(self, target_drop=3.0):
+    def stage2_categorize_and_config(self, target_drop=None):
         """
         STAGE 2: Categorize layers into tiers using MQF Greedy Search
         
@@ -356,6 +356,9 @@ class HybridQuantizer:
         Tier 2 (Medium): Layers where search found 4-bit acceptable.
         Tier 3 (Insensitive): Candidate for granular refinement.
         """
+        
+        if target_drop is None:
+            target_drop = self.thresholds['tier1_threshold']
         
         print("\n" + "="*80)
         print("[STAGE 2] TIER CATEGORIZATION & MQF CONFIG SEARCH")
@@ -434,23 +437,21 @@ class HybridQuantizer:
         return config, tiers
     
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 3: SELECTIVE GRANULAR REFINEMENT (TIER 3 ONLY)
+    # STAGE 3: SELECTIVE GRANULAR REFINEMENT (TIER 2 + TIER 3)
     # ══════════════════════════════════════════════════════════════════════════
     
     def stage3_selective_granular_refinement(self, dataloader, samples=256):
         """
-        STAGE 3: Granular refinement for Tier 3 (insensitive) layers only
+        STAGE 3: Granular refinement for Tier 2 and Tier 3 layers
         
-        Strategy:
-        - Profile top-10 filters per layer (fast test)
-        - Use heuristic: filter magnitude → robustness
-        - Assign 2-bit to robust, keep 4-bit for borderline
-        
-        Time: ~2 hours (vs 8+ for all layers)
+        "Opportunistic Granularity":
+        - We expand refinement to Tier 2 (Medium) layers to find sub-patterns
+          that might improve accuracy or hardware safety.
+        - Profiles filters to decide between 2, 4, and 8 bits.
         """
         
         print("\n" + "="*80)
-        print("[STAGE 3] SELECTIVE GRANULAR REFINEMENT (Tier 3 Only)")
+        print("[STAGE 3] SELECTIVE GRANULAR REFINEMENT (Tier 2 + Tier 3)")
         print("="*80)
         
         if not self.final_config or not hasattr(self, 'tiers'):
@@ -462,9 +463,10 @@ class HybridQuantizer:
         # Baseline for comparison
         baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
         
-        tier3_layers = self.tiers['tier3_insensitive']
+        # [Opportunistic Expansion] Refine both Tier 2 and Tier 3
+        refine_layers = self.tiers['tier3_insensitive'] + self.tiers['tier2_medium']
         
-        for layer_name in tqdm(tier3_layers, desc="Granular Refinement"):
+        for layer_name in tqdm(refine_layers, desc="Granular Refinement"):
             module = self._get_module(layer_name)
             num_filters = self._get_num_filters(module)
             
@@ -528,7 +530,7 @@ class HybridQuantizer:
         for layer_name, filter_bits in granular_configs.items():
             self.final_config[layer_name] = filter_bits
         
-        print(f"\n✓ Granular refinement complete for {len(tier3_layers)} Tier 3 layers")
+        print(f"\n✓ Granular refinement complete for {len(refine_layers)} layers")
         
         return granular_configs
     
@@ -1205,7 +1207,6 @@ def run_hybrid_tier_quantization(model_baseline, dataloader, device='cuda',
     quantizer.print_summary()
     
     print(f"\n✓ TOTAL EXECUTION TIME: {total_time/60:.1f} minutes")
-    print(f"  (Expected: 4-5 hours on GPU)")
     
     return quantizer
 

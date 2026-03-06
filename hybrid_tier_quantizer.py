@@ -713,10 +713,13 @@ class HybridQuantizer:
         quantizer = ActivationQuantizer(bit_width=bits)
         
         def filter_dispatch_hook(module, input, output):
-            # output: [N, C, H, W]
-            # We ONLY quantize the specific channel (filter)
-            q_channel = quantizer(output[:, filter_idx:filter_idx+1, :, :])
-            output[:, filter_idx:filter_idx+1, :, :] = q_channel
+            # Dynamic slicing for Conv2d (4D) or Linear (2D)
+            if output.ndim == 4:
+                q_channel = quantizer(output[:, filter_idx:filter_idx+1, :, :])
+                output[:, filter_idx:filter_idx+1, :, :] = q_channel
+            else: # 2D (Linear)
+                q_channel = quantizer(output[:, filter_idx:filter_idx+1])
+                output[:, filter_idx:filter_idx+1] = q_channel
             return output
             
         handle = module.register_forward_hook(filter_dispatch_hook)
@@ -749,9 +752,13 @@ class HybridQuantizer:
                 quantizers = {b: ActivationQuantizer(bit_width=b) for b in unique_bits if b < 8}
                 
                 def layer_granular_hook(module, input, output, bits_map=filter_bits, qs=quantizers):
+                    is_conv = (output.ndim == 4)
                     for f_idx, b in enumerate(bits_map):
                         if b < 8:
-                            output[:, f_idx:f_idx+1, :, :] = qs[b](output[:, f_idx:f_idx+1, :, :])
+                            if is_conv:
+                                output[:, f_idx:f_idx+1, :, :] = qs[b](output[:, f_idx:f_idx+1, :, :])
+                            else:
+                                output[:, f_idx:f_idx+1] = qs[b](output[:, f_idx:f_idx+1])
                     return output
                     
                 handle = module.register_forward_hook(layer_granular_hook)

@@ -19,7 +19,7 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, base_dir)
 sys.path.insert(0, os.path.join(base_dir, 'quantization_framework'))
 
-from hybrid_tier_quantizer-new import HybridQuantizer, run_hybrid_tier_quantization
+from hybrid_tier_quantizer import HybridQuantizer, run_hybrid_tier_quantization
 from quantization_framework.models.model_loaders import load_model
 from quantization_framework.evaluation.pipeline import (
     get_fashionmnist_dataloader,

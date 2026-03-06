@@ -26,31 +26,6 @@ import time
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ════════════════════════════════════════════════════════════════════════════
-# IMPORTS FROM ORIGINAL MQF REPOSITORY (Joint W=A Quantization)
-# ════════════════════════════════════════════════════════════════════════════
-
-try:
-    from quantization_framework.experiments.joint_sensitivity import (
-        JointQuantizer,
-        measure_joint_sensitivity as mqf_measure_joint_sensitivity
-    )
-    from quantization_framework.experiments.joint_search import (
-        load_joint_sensitivity,
-        greedy_joint_search
-    )
-    from quantization_framework.experiments.validate_config import (
-        insert_activation_quantizers,
-        apply_mixed_precision
-    )
-    from quantization_framework.experiments.verify_wa_constraint import verify_wa_constraint
-    from quantization_framework.quantization.primitives import quantize_tensor
-    
-    ORIGINAL_MQF_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"Some MQF imports may fail: {e}")
-    ORIGINAL_MQF_AVAILABLE = False
-
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ PART 1: DATA STRUCTURES & TYPE HINTS                                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -84,6 +59,30 @@ class RegisterPackingInfo:
     register_utilization: float  # Percentage
     carry_bits_allocated: int
 
+class ActivationQuantizer(nn.Module):
+    """
+    Quantizes activation tensors using symmetric quantization.
+    Applied in real-time via forward hook during inference.
+    """
+    def __init__(self, bit_width=8):
+        super().__init__()
+        self.bit_width = bit_width
+    
+    def forward(self, x):
+        if self.bit_width >= 8:
+            return x
+            
+        # Symmetric quantization
+        max_abs = x.abs().max()
+        qmax = (1 << (self.bit_width - 1)) - 1
+        
+        if max_abs > 0:
+            scale = max_abs / qmax
+            # Quantize and dequantize (Fake Quantization)
+            x_int = torch.round(x / scale).clamp(-qmax - 1, qmax)
+            return x_int * scale
+        return x
+
 class HybridQuantizer:
     """Main optimization framework"""
     
@@ -101,6 +100,7 @@ class HybridQuantizer:
         self.final_config: Dict = {}
         self.packing_info: Dict = {}
         self.metrics: Dict = {}
+        self.activation_hooks = []
         
         # Robust State Backup (Deep Copy)
         # We need this because Profiling modifies weight.data in-place
@@ -125,88 +125,54 @@ class HybridQuantizer:
     
     def stage1_fast_layer_profiling(self, dataloader, samples=256):
         """
-        STAGE 1: JOINT W=A SENSITIVITY PROFILING
+        STAGE 1: Fast layer-wise sensitivity profiling
         
-        Tests BOTH weights AND activations at the SAME bit-width (W=A constraint).
-        Uses JointQuantizer from original MQF repository.
-        
-        Process:
-        ├─ Baseline: Measure FP32 accuracy
-        ├─ For each layer:
-        │  ├─ For each bit-width [2, 4, 8]:
-        │  │  ├─ Create JointQuantizer(layer, bits)
-        │  │  ├─ Apply weight quantization: W → bits
-        │  │  ├─ Register activation hook: A → bits (same as W)
-        │  │  ├─ Run inference
-        │  │  ├─ Measure accuracy drop
-        │  │  ├─ Store: sensitivity[layer][bits] = drop
-        │  │  └─ Restore layer to FP32
-        │  └─ Move to next layer
-        └─ Output: {layer: {2: drop_2b, 4: drop_4b, 8: drop_8b}}
-        
-        Time: ~30-60 min for AlexNet with samples=256
+        Reuses existing MQF infrastructure.
+        Time: ~1 hour on GPU (256 samples per layer, 3 bit-widths)
         """
         
         print("\n" + "="*80)
-        print("[STAGE 1] JOINT W=A SENSITIVITY PROFILING")
+        print("[STAGE 1] FAST LAYER-WISE PROFILING (Tier Detection)")
         print("="*80)
         
         self.model.eval()
-        self.model.to(self.device)
+        bit_widths = [2, 4, 8]
+        sensitivity = {}
         
-        # Baseline accuracy (FP32)
-        print("Measuring baseline FP32 accuracy...")
+        # Get all quantizable layers
+        layers = self._get_quantizable_layers()
+        
+        # Measure baseline accuracy
         baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
         self.metrics['baseline_accuracy'] = baseline_acc
-        print(f"✓ Baseline: {baseline_acc:.2f}%")
+        print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
-        # Get layers to test
-        layers_to_test = []
-        for name, module in self.model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                layers_to_test.append((name, module))
-        
-        print(f"\nProfileing {len(layers_to_test)} layers with W=A pairs...")
-        
-        self.layer_sensitivity = {}
-        bit_widths = [2, 4, 8]
-        
-        for layer_idx, (layer_name, layer_module) in enumerate(tqdm(layers_to_test, desc="Joint Profiling")):
-            layer_results = {bits: {} for bits in bit_widths}
+        # Profile each layer
+        for layer_name in tqdm(layers, desc="Layer Profiling (W=A)"):
+            layer_sensitivity = {}
             
             for bits in bit_widths:
-                # ────────────────────────────────────────────────────
-                # KEY FIX: Use JointQuantizer for W=A testing
-                # ────────────────────────────────────────────────────
-                quantizer = JointQuantizer(layer_module, bit_width=bits)
+                # Apply joint W=A quantization
+                self._apply_joint_quantization(layer_name, bits)
                 
-                try:
-                    # Apply BOTH weight AND activation quantization
-                    quantizer.apply_weight_quantization()      # W → bits
-                    quantizer.setup_activation_quantization()  # A → bits (via hook)
-                    
-                    # Evaluate with joint quantization
-                    acc_quantized = self._evaluate_accuracy(dataloader, samples=samples)
-                    drop = baseline_acc - acc_quantized
-                    
-                    layer_results[bits] = {
-                        'accuracy': acc_quantized,
-                        'drop': drop
-                    }
-                    
-                finally:
-                    # Always restore to FP32 for next test
-                    quantizer.restore()
+                # Measure accuracy drop
+                acc = self._evaluate_accuracy(dataloader, samples=samples)
+                drop = baseline_acc - acc
+                layer_sensitivity[bits] = drop
+                
+                # Restore layer (removes hooks and restores weights)
+                self._restore_layer(layer_name)
             
-            # Store sensitivity for this layer
-            self.layer_sensitivity[layer_name] = {
-                bits: layer_results[bits]['drop'] 
-                for bits in bit_widths
-            }
+            sensitivity[layer_name] = layer_sensitivity
         
-        print(f"✓ Profiling complete. Sensitivity stored for {len(layers_to_test)} layers")
+        self.layer_sensitivity = sensitivity
         
-        return self.layer_sensitivity
+        # Summary
+        print(f"\n✓ Profiled {len(layers)} layers")
+        print(f"  Sample size: {samples} images per test")
+        print(f"  Bit-widths tested: {bit_widths}")
+        
+        return sensitivity
     
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2: TIER CATEGORIZATION & CONFIG GENERATION
@@ -214,109 +180,106 @@ class HybridQuantizer:
     
     def stage2_categorize_and_config(self):
         """
-        STAGE 2: GREEDY SEARCH WITH W=A CONSTRAINT
+        STAGE 2: Categorize layers into tiers
         
-        Uses greedy algorithm from original MQF to find optimal bit-width assignment
-        while respecting:
-        - Target accuracy drop constraint
-        - W=A joint quantization requirement
-        - Tier-based categorization
-        
-        Algorithm:
-        ├─ Initialize: all layers = max_bits (W=A)
-        ├─ For each iteration:
-        │  ├─ Find least sensitive layer
-        │  ├─ Try reducing its bits
-        │  ├─ If drop ≤ target: keep reduction (both W and A)
-        │  └─ Continue
-        ├─ Categorize into tiers based on final assignment
-        └─ Output: {layer: {"weight": bits, "activation": bits}}
+        Tier 1 (Sensitive, ~30%): Keep 8-bit uniform
+        Tier 2 (Medium, ~45%): Keep 4-bit uniform
+        Tier 3 (Insensitive, ~25%): Candidate for granular
         """
         
         print("\n" + "="*80)
-        print("[STAGE 2] GREEDY SEARCH WITH W=A CONSTRAINT")
+        print("[STAGE 2] TIER CATEGORIZATION & CONFIG GENERATION")
         print("="*80)
         
         if not self.layer_sensitivity:
             raise ValueError("Run stage1_fast_layer_profiling first")
         
-        # Convert sensitivity to format expected by greedy_joint_search
-        sensitivity_dict = {}
-        for layer_name, drops in self.layer_sensitivity.items():
-            sensitivity_dict[layer_name] = {
-                'baseline_acc': 100.0,  # Placeholder
-                **drops  # {2: drop_2b, 4: drop_4b, 8: drop_8b}
-            }
-        
-        # ────────────────────────────────────────────────────
-        # KEY FIX: Use greedy_joint_search from original MQF
-        # ────────────────────────────────────────────────────
-        
-        # Call the greedy algorithm
-        # format: {layer: bits_int} with W=A enforced
-        config_bits, stats = greedy_joint_search(
-            sensitivity=sensitivity_dict,
-            bit_choices=[2, 4, 8],
-            target_drop=self.thresholds['tier1_threshold'],  # e.g., 5.0
-            baseline_acc=100.0
+        # Sort layers by 4-bit drop (sensitivity metric)
+        layers_sorted = sorted(
+            self.layer_sensitivity.items(),
+            key=lambda x: x[1][4],  # Sort by 4-bit drop
+            reverse=True  # Highest first = most sensitive
         )
         
-        # Convert to W=A format: {layer: {"weight": bits, "activation": bits}}
-        wa_config = {}
-        for layer_name, bits in config_bits.items():
-            wa_config[layer_name] = {
-                'weight': bits,
-                'activation': bits  # W=A CONSTRAINT ENFORCED
-            }
-        
-        # Store raw config for use in stage3
-        self.final_config = wa_config
-        
-        # ────────────────────────────────────────────────────
-        # CATEGORIZE INTO TIERS based on greedy result
-        # ────────────────────────────────────────────────────
+        # Categorize by Threshold instead of fixed percentages
+        tier1_threshold = self.thresholds['tier1_threshold']
+        tier2_threshold = self.thresholds['tier2_threshold']
         
         tiers = {
-            'tier1_sensitive': [],      # 8-bit
-            'tier2_medium': [],         # 4-bit
-            'tier3_insensitive': []     # 2-bit or granular candidates
+            'tier1_sensitive': [],
+            'tier2_medium': [],
+            'tier3_insensitive': []
         }
         
-        for layer_name, drops in self.layer_sensitivity.items():
-            layer_drop_4b = drops.get(4, 99.0)
+        for layer_name, layer_drop in layers_sorted:
+            drop_4 = layer_drop[4]
             
-            if wa_config[layer_name]['weight'] == 8:
+            if drop_4 > tier1_threshold:
                 tiers['tier1_sensitive'].append(layer_name)
-                tier = 1
-            elif wa_config[layer_name]['weight'] == 4:
+            elif drop_4 > tier2_threshold:
                 tiers['tier2_medium'].append(layer_name)
-                tier = 2
-            else:  # 2-bit or granular
+            else:
                 tiers['tier3_insensitive'].append(layer_name)
-                tier = 3
-            
+
+        config = {}
+        total_layers = len(layers_sorted)
+        
+        # TIER 1: Sensitive (Keep 8-bit)
+        for layer_name in tiers['tier1_sensitive']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 8
             assignment = TierAssignment(
-                layer_name=layer_name,
-                tier=tier,
-                layer_drop_4bit=layer_drop_4b,
-                layer_drop_2bit=drops.get(2, 99.0),
-                rationale=f"Tier {tier}: Assigned {wa_config[layer_name]['weight']}-bit by greedy search (W=A)"
+                layer_name=layer_name, tier=1,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Sensitive (drop {layer_drop[4]:.2f}% > {tier1_threshold}%)"
+            )
+            self.tier_assignments.append(assignment)
+            
+        # TIER 2: Medium (4-bit default)
+        for layer_name in tiers['tier2_medium']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 4
+            assignment = TierAssignment(
+                layer_name=layer_name, tier=2,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Medium (drop {layer_drop[4]:.2f}% > {tier2_threshold}%)"
+            )
+            self.tier_assignments.append(assignment)
+
+        # TIER 3: Insensitive (Granular candidate)
+        for layer_name in tiers['tier3_insensitive']:
+            layer_drop = self.layer_sensitivity[layer_name]
+            config[layer_name] = 4 # Placeholder for Refinement
+            assignment = TierAssignment(
+                layer_name=layer_name, tier=3,
+                layer_drop_4bit=layer_drop[4], layer_drop_2bit=layer_drop[2],
+                rationale=f"Insensitive (drop {layer_drop[4]:.2f}% <= {tier2_threshold}%)"
             )
             self.tier_assignments.append(assignment)
         
-        self.tiers = tiers
-        
         # Print summary
         print(f"\n[TIER BREAKDOWN]")
-        print(f"Tier 1 (8-bit):    {len(tiers['tier1_sensitive']):2d} layers")
-        print(f"Tier 2 (4-bit):    {len(tiers['tier2_medium']):2d} layers")
-        print(f"Tier 3 (Granular): {len(tiers['tier3_insensitive']):2d} layers")
-        print(f"\n[GREEDY SEARCH STATS]")
-        print(f"Total Layers:      {len(wa_config)}")
-        print(f"Estimated Drop:    {stats.get('estimated_drop', 0):.2f}%")
-        print(f"W=A Constraint:    ✓ {len(wa_config)}/{len(wa_config)} layers satisfy W=A")
+        print(f"Tier 1 (Sensitive):     {len(tiers['tier1_sensitive']):2d} layers → 8-bit uniform")
+        for layer in tiers['tier1_sensitive']:
+            drop = self.layer_sensitivity[layer][4]
+            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
         
-        return wa_config, tiers
+        print(f"\nTier 2 (Medium):        {len(tiers['tier2_medium']):2d} layers → layer-wise 4-bit")
+        for layer in tiers['tier2_medium'][:3]:
+            drop = self.layer_sensitivity[layer][4]
+            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
+        if len(tiers['tier2_medium']) > 3:
+            print(f"  └─ ... +{len(tiers['tier2_medium'])-3} more")
+        
+        print(f"\nTier 3 (Insensitive):   {len(tiers['tier3_insensitive']):2d} layers → GRANULAR refinement")
+        for layer in tiers['tier3_insensitive']:
+            drop = self.layer_sensitivity[layer][4]
+            print(f"  ├─ {layer:<20} (drop@4b: {drop:.3f}%)")
+        
+        self.final_config = config
+        self.tiers = tiers
+        
+        return config, tiers
     
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 3: SELECTIVE GRANULAR REFINEMENT (TIER 3 ONLY)
@@ -324,161 +287,98 @@ class HybridQuantizer:
     
     def stage3_selective_granular_refinement(self, dataloader, samples=256):
         """
-        STAGE 3: GRANULAR PER-FILTER W=A REFINEMENT (Tier 3 Only)
+        STAGE 3: Granular refinement for Tier 3 (insensitive) layers only
         
-        For robustly insensitive layers (Tier 3 assigned to 2-bit),
-        refine to per-filter quantization using quantize_tensor at filter level.
+        Strategy:
+        - Profile top-10 filters per layer (fast test)
+        - Use heuristic: filter magnitude → robustness
+        - Assign 2-bit to robust, keep 4-bit for borderline
         
-        Process:
-        ├─ For each Tier 3 layer:
-        │  ├─ Get baseline accuracy
-        │  ├─ For each filter f:
-        │  │  ├─ For each bit-width [2, 4, 8]:
-        │  │  │  ├─ Quantize filter f weights at bits
-        │  │  │  ├─ Test W=f/A=bits (joint via hooks)
-        │  │  │  ├─ Measure drop
-        │  │  │  ├─ Store: filter_sensitivity[f][bits] = drop
-        │  │  │  └─ Restore to FP32
-        │  │  └─ Move to next bit-width
-        │  └─ Apply greedy search at filter level (per-filter greedy)
-        └─ Store per-filter W=A: {layer: [{"filter": f, "weight": b, "act":b}, ...]}
+        Time: ~2 hours (vs 8+ for all layers)
         """
         
         print("\n" + "="*80)
         print("[STAGE 3] SELECTIVE GRANULAR REFINEMENT (Tier 3 Only)")
         print("="*80)
         
-        if not hasattr(self, 'tiers'):
+        if not self.final_config or not hasattr(self, 'tiers'):
             raise ValueError("Run stage2_categorize_and_config first")
         
         self.model.eval()
         granular_configs = {}
         
+        # Baseline for comparison
+        baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
+        
         tier3_layers = self.tiers['tier3_insensitive']
-        print(f"\nRefining {len(tier3_layers)} Tier 3 layers with per-filter W=A...")
         
         for layer_name in tqdm(tier3_layers, desc="Granular Refinement"):
             module = self._get_module(layer_name)
             num_filters = self._get_num_filters(module)
             
-            # Get baseline for this layer
-            baseline_acc = self._evaluate_accuracy(dataloader, samples=samples)
+            # Strategy: Heuristic based on magnitude
+            filter_magnitudes = []
+            for f_idx in range(num_filters):
+                w = module.weight.data[f_idx]
+                magnitude = torch.norm(w).item()
+                filter_magnitudes.append((f_idx, magnitude))
             
-            # ────────────────────────────────────────────────────
-            # PROFILE EACH FILTER with per-filter quantization
-            # ────────────────────────────────────────────────────
+            # Sort by magnitude (small = more robust, typically easier to quantize)
+            filter_magnitudes.sort(key=lambda x: x[1])
             
-            filter_sensitivity = {}
+            # Assign bits based on magnitude percentile
+            robust_threshold = int(num_filters * self.thresholds['filter_robust_percentile'])
+            filter_bits = [8] * num_filters  # Default
             
-            # Limit to top 20 filters for speed
-            num_test_filters = min(num_filters, 20)
-            
-            for f_idx in range(num_test_filters):
-                filter_results = {}
-                
-                for bits in [2, 4, 8]:
-                    try:
-                        # Quantize only this filter's weights
-                        w_f = module.weight.data[f_idx].clone()
-                        w_f_quantized, scale, _ = quantize_tensor(w_f, bit_width=bits, method='symmetric')
-                        
-                        # Save original
-                        original_w_f = module.weight.data[f_idx].clone()
-                        module.weight.data[f_idx] = w_f_quantized
-                        
-                        # Register activation hook for this filter (simplified)
-                        def make_filter_hook(f_id, bits_val):
-                            def hook(m, inp, out):
-                                try:
-                                    # Quantize only output channel f_id
-                                    if out.ndim == 4: # Conv2d
-                                        if out.shape[1] > f_id:
-                                            a_f = out[:, f_id:f_id+1, :, :]
-                                            a_f_max = a_f.abs().max()
-                                            a_scale = a_f_max / ((2**(bits_val-1)) - 1) if a_f_max > 0 else 1.0
-                                            a_f_q = torch.clamp(
-                                                torch.round(a_f / a_scale),
-                                                -2**(bits_val-1),
-                                                2**(bits_val-1)-1
-                                            ) * a_scale
-                                            out[:, f_id:f_id+1, :, :] = a_f_q
-                                    elif out.ndim == 2: # Linear
-                                        if out.shape[1] > f_id:
-                                            a_f = out[:, f_id:f_id+1]
-                                            a_f_max = a_f.abs().max()
-                                            a_scale = a_f_max / ((2**(bits_val-1)) - 1) if a_f_max > 0 else 1.0
-                                            a_f_q = torch.clamp(
-                                                torch.round(a_f / a_scale),
-                                                -2**(bits_val-1),
-                                                2**(bits_val-1)-1
-                                            ) * a_scale
-                                            out[:, f_id:f_id+1] = a_f_q
-                                except:
-                                    pass
-                                return out
-                            return hook
-                        
-                        hook_handle = module.register_forward_hook(make_filter_hook(f_idx, bits))
-                        
-                        # Test accuracy with this filter quantized (W=A)
-                        acc_q = self._evaluate_accuracy(dataloader, samples=min(samples, 128))
-                        drop = baseline_acc - acc_q
-                        
-                        filter_results[bits] = drop
-                        
-                    finally:
-                        # Cleanup
-                        if hook_handle is not None:
-                            hook_handle.remove()
-                        module.weight.data[f_idx] = original_w_f
-                
-                filter_sensitivity[f_idx] = filter_results
-            
-            # Apply greedy-like search at FILTER level
-            # Assign 2-bit to least sensitive, 4-bit to moderately sensitive, 8-bit to sensitive
-            granular_config = []
-            
-            # For tested filters, assign based on sensitivity
-            sorted_filters = sorted(
-                filter_sensitivity.items(),
-                key=lambda x: x[1].get(4, 99.0)  # Sort by 4-bit sensitivity
-            )
-            
-            for f_idx, filter_sens in sorted_filters:
-                drop_at_2b = filter_sens.get(2, 99.0)
-                drop_at_4b = filter_sens.get(4, 99.0)
-                
-                if drop_at_2b < 1.0:
-                    bits = 2  # Very robust
-                elif drop_at_4b < 2.0:
-                    bits = 4  # Moderately robust
+            # Stage 3 MQF Logic: 2-bit, 4-bit, or 8-bit
+            for rank, (f_idx, mag) in enumerate(filter_magnitudes):
+                if rank < robust_threshold:
+                    # Robust filter → start with 2-bit
+                    filter_bits[f_idx] = 2
                 else:
-                    bits = 8  # Keep high precision
+                    # Medium sensitivity → start with 4-bit
+                    filter_bits[f_idx] = 4
+            
+            # Optional: Verify top-5 robust ones with quick profiling
+            top_robust_indices = [f[0] for f in filter_magnitudes[:5]]
+            
+            for f_idx in top_robust_indices:
+                # Profile filter to see if 2-bit or 4-bit is actually safe (W=A)
+                self._apply_joint_filter_quantization(layer_name, f_idx, bits=2)
+                acc_2b = self._evaluate_accuracy(dataloader, samples=64)
+                drop_2b = baseline_acc - acc_2b
                 
-                # ────────────────────────────────────────────────────
-                # ENFORCE W=A CONSTRAINT at per-filter level
-                # ────────────────────────────────────────────────────
-                granular_config.append({
-                    'filter_idx': f_idx,
-                    'weight': bits,
-                    'activation': bits  # W=A CONSTRAINT
-                })
+                if drop_2b > self.thresholds['filter_2bit_threshold']:
+                    # 2-bit failed → try 4-bit
+                    self._restore_filter(layer_name, f_idx) # Clear 2-bit hook/weight
+                    self._apply_joint_filter_quantization(layer_name, f_idx, bits=4)
+                    acc_4b = self._evaluate_accuracy(dataloader, samples=64)
+                    drop_4b = baseline_acc - acc_4b
+                    
+                    if drop_4b > self.thresholds['filter_4bit_threshold']:
+                        # 4-bit also failed! → Keep 8-bit for this specific filter
+                        filter_bits[f_idx] = 8
+                    else:
+                        filter_bits[f_idx] = 4
+                else:
+                    filter_bits[f_idx] = 2
+                
+                self._restore_filter(layer_name, f_idx)
             
-            # For remaining filters not profiled, assign default (4-bit)
-            for f_idx in range(num_test_filters, num_filters):
-                granular_config.append({
-                    'filter_idx': f_idx,
-                    'weight': 4,
-                    'activation': 4  # W=A CONSTRAINT
-                })
+            granular_configs[layer_name] = filter_bits
             
-            granular_configs[layer_name] = granular_config
-            self.final_config[layer_name] = granular_config
+            # Statistics
+            count_2b = sum(1 for b in filter_bits if b == 2)
+            count_4b = sum(1 for b in filter_bits if b == 4)
+            count_8b = sum(1 for b in filter_bits if b == 8)
+            
+            print(f"INFO: {layer_name}: 2-bit={count_2b}, 4-bit={count_4b}, 8-bit={count_8b}")
         
-        # Store for later use
-        self.granular_configs = granular_configs
+        # Merge granular config into main config
+        for layer_name, filter_bits in granular_configs.items():
+            self.final_config[layer_name] = filter_bits
         
-        print(f"✓ Granular refinement complete for {len(granular_configs)} layers")
+        print(f"\n✓ Granular refinement complete for {len(tier3_layers)} Tier 3 layers")
         
         return granular_configs
     
@@ -617,128 +517,63 @@ class HybridQuantizer:
     # ══════════════════════════════════════════════════════════════════════════
     
     def stage5_validation_and_qat(self, model_baseline, dataloader, 
-                                  device='cuda', samples=1000):
+                                  device, samples=1000,
+                                  qat_threshold=2.0, target_drop=3.0):
         """
-        STAGE 5: VALIDATION & QAT
-        
-        Validates Post-Training Quantization (PTQ) with REAL W=A quantization.
-        
-        Process:
-        ├─ Load model with W=A configuration
-        ├─ Apply weight quantization (from stage 2/3 config)
-        ├─ Insert activation quantization hooks (from original MQF)
-        ├─ Run inference: BOTH W and A quantized
-        ├─ Measure accuracy drop
-        ├─ If drop > threshold: trigger QAT recovery (noted)
-        └─ Output: metrics with true W=A accuracy
+        STAGE 5: PTQ validation and optional QAT recovery (W+A Joint)
         """
         
         print("\n" + "="*80)
-        print("[STAGE 5] VALIDATION & QAT (Real-Time W=A Quantization)")
+        print("[STAGE 5] VALIDATION & QAT RECOVERY (W=A)")
         print("="*80)
         
-        model_baseline.eval()
-        model_baseline.to(device)
+        # Use previously saved baseline instead of re-evaluating potentially modified model
+        baseline_acc = self.metrics.get('baseline_accuracy', 0.0)
+        if baseline_acc == 0:
+             baseline_acc = self._evaluate_accuracy_model(model_baseline, dataloader, 
+                                                         device=device, samples=samples)
+        print(f"\nBaseline Accuracy (8-bit Baseline): {baseline_acc:.2f}%")
         
-        # Step 1: Measure baseline FP32 accuracy
-        print("\n[1/4] Measuring baseline accuracy (FP32)...")
-        baseline_acc = self._evaluate_accuracy_model(
-            model_baseline, 
-            dataloader, 
-            device=device, 
-            samples=samples
-        )
-        print(f"✓ Baseline: {baseline_acc:.2f}%")
+        # 1. Apply PTQ with config (Weights)
+        model_quantized = self._apply_tier_quantization(self.model, self.final_config)
         
-        # Step 2: Apply weight quantization
-        print("[2/4] Applying weight quantization (from Stage 2 config)...")
+        # 2. Add Activation Hooks for Final Inference
+        self._add_final_activation_hooks(model_quantized, self.final_config)
         
-        # Build weight configuration (extract weight bits from W=A config)
-        weight_config = {}
-        for layer_name, cfg in self.final_config.items():
-            if isinstance(cfg, dict) and 'weight' in cfg:
-                # Layer-wise: {layer: {"weight": bits, "activation": bits}}
-                weight_config[layer_name] = cfg['weight']
-            elif isinstance(cfg, list):
-                # Granular: [{filter_idx, weight, activation}, ...]
-                weight_config[layer_name] = [c['weight'] for c in cfg]
-            else:
-                # Fallback
-                weight_config[layer_name] = cfg
-        
-        # Apply weight quantization
-        model_quantized = self._apply_tier_quantization(
-            model_baseline, 
-            weight_config
-        )
         model_quantized.to(device)
-        print(f"✓ Weight quantization applied to {len(weight_config)} layers")
-        
-        # Step 3: Insert activation quantization hooks
-        print("[3/4] Inserting activation quantization hooks...")
-        
-        # Build activation configuration (extract activation bits from W=A config)
-        activation_config = {}
-        for layer_name, cfg in self.final_config.items():
-            if isinstance(cfg, dict) and 'activation' in cfg:
-                # Layer-wise
-                activation_config[layer_name] = cfg['activation']
-            elif isinstance(cfg, list):
-                # Granular - use max for now (simplified)
-                activation_config[layer_name] = max(c['activation'] for c in cfg)
-            else:
-                activation_config[layer_name] = cfg
-        
-        # ────────────────────────────────────────────────────
-        # KEY FIX: Use insert_activation_quantizers from original MQF
-        # ────────────────────────────────────────────────────
-        
-        model_quantized, quantizers = insert_activation_quantizers(
-            model_quantized,
-            config=activation_config,
-            quantize_activations=True
-        )
-        print(f"✓ Activation hooks inserted ({len(quantizers)} quantizers)")
-        
-        # Step 4: PTQ validation with W=A quantization
-        print("[4/4] Validating PTQ accuracy (Real-Time W=A Quantization)...")
         model_quantized.eval()
-        ptq_acc = self._evaluate_accuracy_model(
-            model_quantized, 
-            dataloader, 
-            device=device, 
-            samples=samples
-        )
-        accuracy_drop = baseline_acc - ptq_acc
         
-        print(f"\n[PTQ RESULTS]")
-        print(f"Baseline Accuracy:  {baseline_acc:.2f}%")
-        print(f"PTQ Accuracy:       {ptq_acc:.2f}%")
-        print(f"Accuracy Drop:      {accuracy_drop:.3f}%")
-        print(f"W=A Constraint:     ✓ Enforced")
+        # Measure PTQ accuracy
+        ptq_acc = self._evaluate_accuracy_model(model_quantized, dataloader,
+                                               device=device, samples=samples)
+        ptq_drop = baseline_acc - ptq_acc
         
-        # Store metrics
-        self.metrics = {
-            'baseline_accuracy': baseline_acc,
-            'final_accuracy': ptq_acc,
-            'accuracy_drop_percent': accuracy_drop,
-            'quantization_type': 'W=A joint (layer-wise + granular)',
-            'tier1_layers': len(self.tiers.get('tier1_sensitive', [])),
-            'tier2_layers': len(self.tiers.get('tier2_medium', [])),
-            'tier3_layers': len(self.tiers.get('tier3_insensitive', [])),
-            'ptq_status': 'PASS' if accuracy_drop <= 5.0 else 'FAIL'
-        }
+        print(f"PTQ Accuracy (Joint W=A):  {ptq_acc:.2f}%")
+        print(f"Accuracy Drop (PTQ):      {ptq_drop:.3f}%")
         
-        # Check if QAT would be needed
-        qat_threshold = 2.0
+        # Decision
+        final_acc = ptq_acc
+        used_qat = False
         
-        if accuracy_drop > qat_threshold:
-            print(f"\n⚠️  Accuracy drop ({accuracy_drop:.2f}%) exceeds QAT threshold ({qat_threshold}%)")
-            print("Note: QAT recovery would be triggered here (not implemented in POC)")
+        if ptq_drop <= qat_threshold:
+            print(f"\n✓ PTQ PASSED (drop {ptq_drop:.3f}% ≤ {qat_threshold}%)")
         else:
-            print(f"\n✅ PTQ PASSED: Drop ({accuracy_drop:.3f}%) within tolerance")
+            print(f"\n⚠ PTQ MARGINAL (drop {ptq_drop:.3f}% > {qat_threshold}%)")
+            print("→ QAT recovery recommended but skipped for research")
+            # In production, would run QAT here
         
-        return model_quantized, self.metrics
+        metrics = {
+            'baseline_accuracy': baseline_acc,
+            'ptq_accuracy': ptq_acc,
+            'final_accuracy': final_acc,
+            'accuracy_drop_percent': baseline_acc - final_acc,
+            'ptq_drop_percent': ptq_drop,
+            'used_qat': used_qat,
+            'target_drop_percent': target_drop
+        }
+        self.metrics.update(metrics)
+        
+        return metrics
     
     # ══════════════════════════════════════════════════════════════════════════
     # HELPER METHODS
@@ -816,7 +651,7 @@ class HybridQuantizer:
         return 100 * correct / total
     
     def _apply_layer_quantization(self, layer_name: str, bits: int):
-        """Quantize a layer uniformly"""
+        """Quantize a layer uniformly (Weights Only)"""
         module = self._get_module(layer_name)
         w = module.weight.data
         
@@ -829,15 +664,37 @@ class HybridQuantizer:
         w_dequant = w_int * scale
         
         module.weight.data = w_dequant
+
+    def _apply_joint_quantization(self, layer_name: str, bits: int):
+        """Quantize a layer Jointly (Weights + Activations)"""
+        # 1. Weight Quantization
+        self._apply_layer_quantization(layer_name, bits)
+        
+        # 2. Activation Quantization (via hook)
+        module = self._get_module(layer_name)
+        quantizer = ActivationQuantizer(bit_width=bits)
+        
+        def hook_fn(module, input, output):
+            return quantizer(output)
+            
+        handle = module.register_forward_hook(hook_fn)
+        self.activation_hooks.append((layer_name, handle))
+
+    def _clear_hooks(self):
+        """Remove all activation hooks"""
+        for layer_name, handle in self.activation_hooks:
+            handle.remove()
+        self.activation_hooks = []
     
     def _apply_filter_quantization(self, layer_name: str, filter_idx: int, 
                                   bits: int):
-        """Quantize a specific filter"""
+        """Quantize a specific filter (Weights Only)"""
         module = self._get_module(layer_name)
         w = module.weight.data
-        
-        qmax = (1 << (bits - 1)) - 1
         w_f = w[filter_idx]
+        
+        # Symmetric quantization
+        qmax = (1 << (bits - 1)) - 1
         w_f_max = torch.max(torch.abs(w_f))
         scale = w_f_max / qmax if w_f_max > 0 else 1.0
         
@@ -845,12 +702,82 @@ class HybridQuantizer:
         w_f_dequant = w_f_int * scale
         
         w[filter_idx] = w_f_dequant
+
+    def _apply_joint_filter_quantization(self, layer_name: str, filter_idx: int, bits: int):
+        """Quantize a specific filter Jointly (Weight + Activation Dispatch)"""
+        # 1. Weight
+        self._apply_filter_quantization(layer_name, filter_idx, bits)
+        
+        # 2. Activation Hook with Filter Dispatch
+        module = self._get_module(layer_name)
+        quantizer = ActivationQuantizer(bit_width=bits)
+        
+        def filter_dispatch_hook(module, input, output):
+            # Dynamic slicing for Conv2d (4D) or Linear (2D)
+            if output.ndim == 4:
+                q_channel = quantizer(output[:, filter_idx:filter_idx+1, :, :])
+                output[:, filter_idx:filter_idx+1, :, :] = q_channel
+            else: # 2D (Linear)
+                q_channel = quantizer(output[:, filter_idx:filter_idx+1])
+                output[:, filter_idx:filter_idx+1] = q_channel
+            return output
+            
+        handle = module.register_forward_hook(filter_dispatch_hook)
+        self.activation_hooks.append((layer_name, handle))
+
+    def _add_final_activation_hooks(self, model, config):
+        """Register hooks for final inference based on config"""
+        self._clear_hooks() # Reset
+        
+        for layer_name, layer_config in config.items():
+            module = self._get_module(layer_name)
+            
+            if isinstance(layer_config, int):
+                # Uniform Layer-wise Activation Hook
+                bits = layer_config
+                if bits >= 8: continue
+                
+                quantizer = ActivationQuantizer(bit_width=bits)
+                handle = module.register_forward_hook(lambda m, i, o, q=quantizer: q(o))
+                self.activation_hooks.append((layer_name, handle))
+            else:
+                # Granular Per-Filter Activation Dispatch
+                # We use a single hook per layer for efficiency but dispatch per filter
+                filter_bits = layer_config
+                unique_bits = sorted(list(set(filter_bits)))
+                
+                if all(b >= 8 for b in unique_bits): continue
+                
+                # Create quantizers for each bit-width present in this layer
+                quantizers = {b: ActivationQuantizer(bit_width=b) for b in unique_bits if b < 8}
+                
+                def layer_granular_hook(module, input, output, bits_map=filter_bits, qs=quantizers):
+                    is_conv = (output.ndim == 4)
+                    for f_idx, b in enumerate(bits_map):
+                        if b < 8:
+                            if is_conv:
+                                output[:, f_idx:f_idx+1, :, :] = qs[b](output[:, f_idx:f_idx+1, :, :])
+                            else:
+                                output[:, f_idx:f_idx+1] = qs[b](output[:, f_idx:f_idx+1])
+                    return output
+                    
+                handle = module.register_forward_hook(layer_granular_hook)
+                self.activation_hooks.append((layer_name, handle))
     
     def _restore_layer(self, layer_name: str):
-        """Reload original weights from deep copy"""
+        """Reload original weights and remove specific layer hook"""
         module = self._get_module(layer_name)
         orig_data = self.original_state_dict[f"{layer_name}.weight"].to(self.device)
         module.weight.data = orig_data.clone()
+        
+        # Remove hook for this layer
+        new_hooks = []
+        for name, handle in self.activation_hooks:
+            if name == layer_name:
+                handle.remove()
+            else:
+                new_hooks.append((name, handle))
+        self.activation_hooks = new_hooks
     
     def _restore_filter(self, layer_name: str, filter_idx: int):
         """Restore specific filter"""
@@ -859,52 +786,28 @@ class HybridQuantizer:
         module.weight.data[filter_idx] = original_w[filter_idx].clone()
     
     def _apply_tier_quantization(self, model, config):
-        """Apply weight quantization according to config (extract weight bits from W=A config)"""
+        """Apply quantization according to config"""
         for layer_name, layer_config in config.items():
             module = self._get_module(layer_name)
             w = module.weight.data
             
             if isinstance(layer_config, int):
-                # Simple: just an int bit-width
+                # Uniform quantization
                 bits = layer_config
                 qmax = (1 << (bits - 1)) - 1
                 w_abs_max = torch.max(torch.abs(w))
                 scale = w_abs_max / qmax if w_abs_max > 0 else 1.0
                 w_int = torch.round(w / scale).clamp(-qmax - 1, qmax)
                 module.weight.data = w_int * scale
-            
-            elif isinstance(layer_config, dict) and 'weight' in layer_config:
-                # W=A format: {layer: {"weight": bits, "activation": bits}}
-                bits = layer_config['weight']
-                qmax = (1 << (bits - 1)) - 1
-                w_abs_max = torch.max(torch.abs(w))
-                scale = w_abs_max / qmax if w_abs_max > 0 else 1.0
-                w_int = torch.round(w / scale).clamp(-qmax - 1, qmax)
-                module.weight.data = w_int * scale
-            
-            elif isinstance(layer_config, list):
-                # Check if it's a list of ints or list of dicts (granular)
-                if len(layer_config) > 0 and isinstance(layer_config[0], dict):
-                    # Granular: [{filter_idx, weight, activation}, ...]
-                    for f_idx, f_config in enumerate(layer_config):
-                        if f_idx < w.shape[0]:
-                            bits = f_config.get('weight', f_config) if isinstance(f_config, dict) else f_config
-                            w_f = w[f_idx]
-                            qmax = (1 << (bits - 1)) - 1
-                            w_f_max = torch.max(torch.abs(w_f))
-                            scale = w_f_max / qmax if w_f_max > 0 else 1.0
-                            w_f_int = torch.round(w_f / scale).clamp(-qmax - 1, qmax)
-                            w[f_idx] = w_f_int * scale
-                else:
-                    # Simple list of ints: [2, 4, 8, ...]
-                    for f_idx, bits in enumerate(layer_config):
-                        if f_idx < w.shape[0]:
-                            w_f = w[f_idx]
-                            qmax = (1 << (bits - 1)) - 1
-                            w_f_max = torch.max(torch.abs(w_f))
-                            scale = w_f_max / qmax if w_f_max > 0 else 1.0
-                            w_f_int = torch.round(w_f / scale).clamp(-qmax - 1, qmax)
-                            w[f_idx] = w_f_int * scale
+            else:
+                # Per-filter quantization
+                for f_idx, bits in enumerate(layer_config):
+                    w_f = w[f_idx]
+                    qmax = (1 << (bits - 1)) - 1
+                    w_f_max = torch.max(torch.abs(w_f))
+                    scale = w_f_max / qmax if w_f_max > 0 else 1.0
+                    w_f_int = torch.round(w_f / scale).clamp(-qmax - 1, qmax)
+                    w[f_idx] = w_f_int * scale
         
         return model
     
@@ -913,73 +816,20 @@ class HybridQuantizer:
     # ══════════════════════════════════════════════════════════════════════════
     
     def save_results(self, output_dir: str = "results"):
-        """Save all results to disk with W=A constraint documented"""
+        """Save all results to disk"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # ════════════════════════════════════════════════════════════
-        # CONFIG FILE: Document W=A constraint explicitly
-        # ════════════════════════════════════════════════════════════
-        
+        # Save config
         config_path = os.path.join(output_dir, "hybrid_config.json")
-        
-        # Convert config to W=A format for clarity
-        json_config = {}
-        for layer_name, cfg in self.final_config.items():
-            if isinstance(cfg, dict):
-                # Already in W=A format
-                json_config[layer_name] = cfg
-            elif isinstance(cfg, list):
-                # Granular format - preserve as is
-                json_config[layer_name] = cfg
-            else:
-                # Fallback (shouldn't happen)
-                json_config[layer_name] = {
-                    'weight': cfg,
-                    'activation': cfg
-                }
-        
-        # Add metadata documenting W=A constraint
-        output_data = {
-            'config': json_config,
-            'metadata': {
-                'algorithm': 'Hybrid Tier Quantization with Joint W=A',
-                'constraint': 'W=A enforced (weight_bits == activation_bits)',
-                'compliance': '100% (all layers/filters satisfy W=A)',
-                'total_layers': len(json_config),
-                'metrics': self.metrics,
-                'tiers': {
-                    'tier1_sensitive_8bit': len(self.tiers.get('tier1_sensitive', [])),
-                    'tier2_medium_4bit': len(self.tiers.get('tier2_medium', [])),
-                    'tier3_insensitive_granular': len(self.tiers.get('tier3_insensitive', []))
-                }
-            }
-        }
-        
         with open(config_path, 'w') as f:
-            json.dump(output_data, f, indent=2)
-        
-        # Verify W=A constraint
-        try:
-            verify_wa_constraint(config_path)
-        except Exception as e:
-            logger.warning(f"W=A verification failed: {e}")
-        
-        # Save weight and activation configs separately for compatibility
-        weight_config = {}
-        activation_config = {}
-        for layer_name, cfg in json_config.items():
-            if isinstance(cfg, dict):
-                weight_config[layer_name] = cfg['weight']
-                activation_config[layer_name] = cfg['activation']
-            elif isinstance(cfg, list):
-                weight_config[layer_name] = [c['weight'] for c in cfg]
-                activation_config[layer_name] = [c['activation'] for c in cfg]
-        
-        with open(os.path.join(output_dir, "hybrid_config_weight.json"), 'w') as f:
-            json.dump(weight_config, f, indent=2)
-            
-        with open(os.path.join(output_dir, "hybrid_config_activation.json"), 'w') as f:
-            json.dump(activation_config, f, indent=2)
+            # Convert config for JSON serialization
+            json_config = {}
+            for layer, cfg in self.final_config.items():
+                if isinstance(cfg, int):
+                    json_config[layer] = cfg
+                else:
+                    json_config[layer] = [int(b) for b in cfg]
+            json.dump(json_config, f, indent=2)
         
         # Save tier assignments
         tiers_path = os.path.join(output_dir, "tier_assignments.csv")
@@ -1001,14 +851,13 @@ class HybridQuantizer:
                     cfg = self.final_config[layer_name]
                     granular_detail[layer_name] = {
                         'num_filters': len(cfg),
-                        'filter_configs': cfg,  # Now includes W=A pairs
+                        'filter_bits': [int(b) for b in cfg],
                         'bit_distribution': {
-                            '2bit': sum(1 for c in cfg if c['weight'] == 2),
-                            '4bit': sum(1 for c in cfg if c['weight'] == 4),
-                            '8bit': sum(1 for c in cfg if c['weight'] == 8),
+                            '2bit': sum(1 for b in cfg if b == 2),
+                            '4bit': sum(1 for b in cfg if b == 4),
+                            '8bit': sum(1 for b in cfg if b == 8),
                         },
-                        'average_bits': round(sum(c['weight'] for c in cfg) / len(cfg), 2),
-                        'w_a_constraint': 'Enforced (100% match)',
+                        'average_bits': round(sum(cfg) / len(cfg), 2),
                         'rationale': f"Tier 3 (Insensitive): Granular optimized. Drop@4b: {assignment.layer_drop_4bit:.3f}%"
                     }
         if granular_detail:
@@ -1021,10 +870,8 @@ class HybridQuantizer:
             json.dump(self.metrics, f, indent=2)
         
         print(f"\n✓ Results saved to {output_dir}/")
-        print(f"  ├─ hybrid_config.json (W=A config with metadata)")
-        print(f"  ├─ hybrid_config_weight.json (Weight bits only)")
-        print(f"  ├─ hybrid_config_activation.json (Activation bits only)")
-        print(f"  ├─ granular_filter_configs.json (Per-filter W=A pairs)")
+        print(f"  ├─ hybrid_config.json (Layer-wise quantization spec)")
+        print(f"  ├─ granular_filter_configs.json (Filter-level detail for Tier 3)")
         print(f"  ├─ tier_assignments.csv (Layer categorization)")
         print(f"  └─ metrics.json (Accuracy & compression metrics)")
 

@@ -920,6 +920,7 @@ class HybridQuantizer:
                 bits = layer_config
                 if bits >= 8: continue
                 
+                quantizer = ActivationQuantizer(bit_width=bits, register_width=self.register_width)
                 handle = module.register_forward_hook(lambda m, i, o, q=quantizer: q(o))
                 self.activation_hooks.append((layer_name, handle))
             else:
